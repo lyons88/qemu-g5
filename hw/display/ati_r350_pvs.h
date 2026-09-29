@@ -232,6 +232,7 @@ typedef struct R300PvsCSrc {
     uint8_t sel[4];
     uint8_t neg;                /* a bit per channel */
     bool abs;
+    bool plain;                 /* .xyzw, no abs, no negate: a copy */
     float kv[4];                /* a constant operand, finished */
 } R300PvsCSrc;
 

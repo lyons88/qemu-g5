@@ -456,12 +456,19 @@ static void r300_pvs_csrc_make(const R300PvsProgram *p, uint32_t dw,
 
     o->abs = (dw & R300_PVS_SRC_ABS_XYZW) != 0;
     o->neg = 0;
+    o->plain = !o->abs;
     for (c = 0; c < 4; c++) {
         o->sel[c] = (dw >> (R300_PVS_SRC_SWIZZLE_SHIFT + 3 * c)) &
                     R300_PVS_SRC_SWIZZLE_MASK;
         if ((dw >> (R300_PVS_SRC_MODIFIER_SHIFT + c)) & 1) {
             o->neg |= 1u << c;
         }
+        if (o->sel[c] != c) {
+            o->plain = false;
+        }
+    }
+    if (o->neg) {
+        o->plain = false;
     }
     switch (type) {
     case R300_PVS_SRC_REG_INPUT:
@@ -508,6 +515,10 @@ static inline void r300_pvs_csrc(const R300PvsCSrc *o, const R300PvsRegs *r,
     default:
         v = r->tmp[o->idx];
         break;
+    }
+    if (o->plain) {
+        memcpy(out, v, 4 * sizeof(float));
+        return;
     }
     for (c = 0; c < 4; c++) {
         unsigned sel = o->sel[c];
