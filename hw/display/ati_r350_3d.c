@@ -343,6 +343,14 @@ typedef struct R300Raster {
     /* job << 32 | last stripe << 16 | next stripe to take */
     uint64_t next;
     unsigned stripes_done;
+    /*
+     * A VERTEX job instead of a raster one: `vfn` over [0, vn) in chunks
+     * of R300_VTX_CHUNK, the chunks taken exactly as stripes are.
+     */
+    bool vjob;
+    void (*vfn)(void *ctx, unsigned k0, unsigned k1);
+    void *vctx;
+    unsigned vn;
     /* bus-memory textures of the primitive in hand, as host copies */
     uint32_t *shadow[R300_TEX_UNITS];
     size_t shadow_size[R300_TEX_UNITS];
@@ -4532,6 +4540,59 @@ static void r300_raster_stripes(ATIR350State *s, R300Raster *q, uint32_t job)
     }
 }
 
+#define R300_VTX_CHUNK 32
+
+static void r300_vtx_chunks(R300Raster *q, uint32_t job)
+{
+    int c;
+
+    while ((c = r300_raster_take(q, job)) >= 0) {
+        unsigned k0 = (unsigned)c * R300_VTX_CHUNK;
+
+        q->vfn(q->vctx, k0, MIN(k0 + R300_VTX_CHUNK, q->vn));
+        qatomic_inc(&q->stripes_done);
+    }
+}
+
+/*
+ * Run fn over [0, n) on the submitting thread and the raster workers.
+ * The vertex stage used to run on the command processor alone -- 55% of
+ * its time on OpenMark, with the three raster workers idle 78% of it.
+ * Every vertex is independent of every other, so any split is exact.
+ */
+static void r300_vtx_run(ATIR350State *s, unsigned n,
+                         void (*fn)(void *, unsigned, unsigned), void *ctx)
+{
+    R300Raster *q = s->raster;
+    unsigned chunks = DIV_ROUND_UP(n, R300_VTX_CHUNK), helpers, i;
+
+    /* below four chunks a wakeup costs about what it saves */
+    if (!q || !q->nworkers || chunks < 4 || chunks > 0xffff) {
+        fn(ctx, 0, n);
+        return;
+    }
+    helpers = MIN(q->nworkers, chunks - 1);
+    q->job++;
+    q->vfn = fn;
+    q->vctx = ctx;
+    q->vn = n;
+    qatomic_set(&q->vjob, true);
+    qatomic_set(&q->stripes_done, 0);
+    for (i = 0; i < helpers; i++) {
+        qatomic_store_release(&q->worker[i].job, q->job);
+    }
+    qatomic_store_release(&q->next, (uint64_t)q->job << 32 |
+                                    (uint64_t)(chunks - 1) << 16);
+    for (i = 0; i < helpers; i++) {
+        qemu_sem_post(&q->worker[i].start);
+    }
+    r300_vtx_chunks(q, q->job);
+    while (qatomic_load_acquire(&q->stripes_done) < chunks) {
+        cpu_relax();
+    }
+    qatomic_set(&q->vjob, false);
+}
+
 static void *r300_raster_thread(void *opaque)
 {
     R300RasterWorker *w = opaque;
@@ -4546,7 +4607,15 @@ static void *r300_raster_thread(void *opaque)
         if (qatomic_read(&q->quit)) {
             break;
         }
-        r300_raster_stripes(s, q, qatomic_load_acquire(&w->job));
+        {
+            uint32_t job = qatomic_load_acquire(&w->job);
+
+            if (qatomic_read(&q->vjob)) {
+                r300_vtx_chunks(q, job);
+            } else {
+                r300_raster_stripes(s, q, job);
+            }
+        }
     }
     rcu_unregister_thread();
     return NULL;
@@ -7889,6 +7958,113 @@ static uint32_t r300_vc_swap(uint32_t val, unsigned mode)
  * went unread, so its vertex program's coordinate input read the
  * (0,0,0,1) default and the board sampled one texel for every pixel.
  */
+/*
+ * One vertex of an array-of-structures draw: fetch, unpack, the vertex
+ * program, the viewport. Everything it reads is the draw's and nothing
+ * it writes is shared, which is what lets r300_draw_aos() hand these to
+ * the raster workers.
+ */
+typedef struct R300AosCtx {
+    ATIR350State *s;
+    R300DrawState *d;
+    const R300VtxFmt *fmt;
+    unsigned narr, vsize, swap;
+    const uint32_t *addr;
+    const unsigned *size, *stride;
+    uint32_t *const *arr;
+    const uint8_t *const *vp;
+    const unsigned *vxr;
+    const R300TexSrc *ts;
+    const unsigned *list;       /* indices to shade, or NULL: base + k */
+    unsigned n, base;
+    R300Vtx *out;               /* indexed by vertex index */
+} R300AosCtx;
+
+static void r300_aos_one(const R300AosCtx *cx, unsigned vi, R300Vtx *v,
+                         bool first, uint32_t *dw)
+{
+    ATIR350State *s = cx->s;
+    R300DrawState *d = cx->d;
+    unsigned n = 0, a, c;
+
+    for (a = 0; a < cx->narr; a++) {
+        unsigned base = n;
+
+        for (c = 0; c < cx->size[a] && n < R300_VTX_DWORDS_MAX; c++) {
+            uint32_t card, val, off;
+
+            if (cx->vp[a]) {
+                /* VRAM: the VC swap never applies there */
+                const uint8_t *q = cx->vp[a] +
+                                   (size_t)(vi * cx->stride[a] + c) * 4;
+                unsigned x = cx->vxr[a];
+
+                dw[n++] = (uint32_t)q[0 ^ x] |
+                          (uint32_t)q[1 ^ x] << 8 |
+                          (uint32_t)q[2 ^ x] << 16 |
+                          (uint32_t)q[3 ^ x] << 24;
+                continue;
+            }
+            card = cx->addr[a] + (vi * cx->stride[a] + c) * 4;
+            val = cx->arr[a] ? cx->arr[a][vi * cx->stride[a] + c]
+                             : ati_r350_mc_read32(s, card);
+            if (cx->swap && !ati_r350_mc_to_vram(s, card, &off)) {
+                val = r300_vc_swap(val, cx->swap);
+            }
+            dw[n++] = val;
+        }
+        if (first) {
+            /*
+             * Where this array resolved to, and the dwords the first
+             * vertex fetched from it -- enough to tell plausible float
+             * coordinates from garbage without re-reading memory (which
+             * would change what the trace observes).
+             */
+            if (trace_event_get_state_backends(
+                    TRACE_ATI_R350_3D_VBUF_AOS_SRC)) {
+                uint64_t target;
+                const char *win = ati_r350_mc_describe(s, cx->addr[a],
+                                                       &target);
+
+                trace_ati_r350_3d_vbuf_aos_src(a, cx->size[a], cx->stride[a],
+                                               cx->addr[a], win, target);
+            }
+            trace_ati_r350_3d_vbuf_aos_dw(a,
+                n > base ? dw[base] : 0,
+                n > base + 1 ? dw[base + 1] : 0,
+                n > base + 2 ? dw[base + 2] : 0,
+                n > base + 3 ? dw[base + 3] : 0);
+        }
+    }
+    r300_load_vtx(d, cx->fmt, dw, cx->vsize, cx->size[0], v);
+    r300_attr_texcoord(d, cx->fmt, dw, cx->ts, v);
+    if (first && d->textured) {
+        r300_trace_texcoord(d, cx->fmt, dw, v);
+    }
+    if (d->vs_run) {
+        float clip[4];
+
+        if (r300_vs_vtx(s, d, cx->fmt, dw, v, clip)) {
+            r300_xform_vtx(s, d, v, clip);
+            return;
+        }
+    }
+    r300_xform_vtx(s, d, v, NULL);
+}
+
+static void r300_aos_range(void *opaque, unsigned k0, unsigned k1)
+{
+    const R300AosCtx *cx = opaque;
+    uint32_t dw[R300_VTX_DWORDS_MAX];
+    unsigned k;
+
+    for (k = k0; k < k1; k++) {
+        unsigned vi = cx->list ? cx->list[k] : cx->base + k;
+
+        r300_aos_one(cx, vi, &cx->out[vi], false, dw);
+    }
+}
+
 static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
 {
     unsigned prim = vf & 0xf;
@@ -7902,7 +8078,7 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
     unsigned swap = s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_VC_SWAP;
     R300DrawState d;
     R300VtxFmt fmt = { 0 };
-    unsigned i, a, c;
+    unsigned i, a;
 
     if (narr > R300_AOS_MAX) {
         ati_r350_note_gap(s, R350_GAP_AOS_ARRAYS, narr);
@@ -8025,74 +8201,66 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
             }
         }
         r300_texcoord_src(&d, vsize, size[0], ts);
-        for (i = 0; i < nvtx; i++) {
-            unsigned n = 0;
-            unsigned vi = idx ? idx[i] : i;
+        {
+            R300AosCtx cx = {
+                .s = s, .d = &d, .fmt = &fmt, .narr = narr, .vsize = vsize,
+                .swap = swap, .addr = addr, .size = size, .stride = stride,
+                .arr = arr, .vp = vp, .vxr = vxr, .ts = ts,
+            };
+            g_autofree R300Vtx *ub = NULL;
+            g_autofree unsigned *list = NULL;
+            bool par = true;
+            unsigned first_vi = idx ? idx[0] : 0, nu = 0;
 
+            /* the bus path touches QEMU memory and the GL target: serial */
             for (a = 0; a < narr; a++) {
-                unsigned base = n;
-
-                for (c = 0; c < size[a] && n < R300_VTX_DWORDS_MAX; c++) {
-                    uint32_t card, val, off;
-
-                    if (vp[a]) {
-                        /* VRAM: the VC swap never applies there */
-                        const uint8_t *q = vp[a] +
-                                           (size_t)(vi * stride[a] + c) * 4;
-                        unsigned x = vxr[a];
-
-                        dw[n++] = (uint32_t)q[0 ^ x] |
-                                  (uint32_t)q[1 ^ x] << 8 |
-                                  (uint32_t)q[2 ^ x] << 16 |
-                                  (uint32_t)q[3 ^ x] << 24;
-                        continue;
-                    }
-                    card = addr[a] + (vi * stride[a] + c) * 4;
-                    val = arr[a] ? arr[a][vi * stride[a] + c]
-                                 : ati_r350_mc_read32(s, card);
-                    if (swap && !ati_r350_mc_to_vram(s, card, &off)) {
-                        val = r300_vc_swap(val, swap);
-                    }
-                    dw[n++] = val;
-                }
-                if (i == 0) {
-                    /*
-                     * Where this array resolved to, and the dwords the
-                     * first vertex fetched from it -- enough to tell
-                     * plausible float coordinates from garbage without
-                     * re-reading memory (which would change what the
-                     * trace observes).
-                     */
-                    if (trace_event_get_state_backends(
-                            TRACE_ATI_R350_3D_VBUF_AOS_SRC)) {
-                        uint64_t target;
-                        const char *win = ati_r350_mc_describe(s, addr[a],
-                                                               &target);
-
-                        trace_ati_r350_3d_vbuf_aos_src(a, size[a], stride[a],
-                                                       addr[a], win, target);
-                    }
-                    trace_ati_r350_3d_vbuf_aos_dw(a,
-                        n > base ? dw[base] : 0,
-                        n > base + 1 ? dw[base + 1] : 0,
-                        n > base + 2 ? dw[base + 2] : 0,
-                        n > base + 3 ? dw[base + 3] : 0);
+                if (size[a] && !vp[a] && !arr[a]) {
+                    par = false;
                 }
             }
-            r300_load_vtx(&d, &fmt, dw, vsize, size[0], &vb[i]);
-            r300_attr_texcoord(&d, &fmt, dw, ts, &vb[i]);
-            if (i == 0 && d.textured) {
-                r300_trace_texcoord(&d, &fmt, dw, &vb[i]);
-            }
-            if (d.vs_run) {
-                float clip[4];
+            if (idx) {
+                /*
+                 * An indexed draw names a vertex as often as triangles
+                 * share it. Shade each one ONCE -- the result depends on
+                 * nothing but its index -- and hand out copies.
+                 */
+                g_autofree uint8_t *seen = g_new0(uint8_t, nfetch);
 
-                if (r300_vs_vtx(s, &d, &fmt, dw, &vb[i], clip)) {
-                    r300_xform_vtx(s, &d, &vb[i], clip);
-                    continue;
+                list = g_new(unsigned, nfetch);
+                for (i = 0; i < nvtx; i++) {
+                    if (!seen[idx[i]]) {
+                        seen[idx[i]] = 1;
+                        if (idx[i] != first_vi) {
+                            list[nu++] = idx[i];
+                        }
+                    }
+                }
+                ub = g_new(R300Vtx, nfetch);
+                cx.out = ub;
+                cx.list = list;
+            } else {
+                cx.out = vb;
+                cx.list = NULL;
+            }
+            /* the first vertex on this thread, with its traces */
+            r300_aos_one(&cx, first_vi, &cx.out[first_vi], true, dw);
+            if (idx) {
+                cx.n = nu;
+                cx.base = 0;
+            } else {
+                cx.n = nvtx - 1;
+                cx.base = 1;
+            }
+            if (par) {
+                r300_vtx_run(s, cx.n, r300_aos_range, &cx);
+            } else {
+                r300_aos_range(&cx, 0, cx.n);
+            }
+            if (idx) {
+                for (i = 0; i < nvtx; i++) {
+                    vb[i] = ub[idx[i]];
                 }
             }
-            r300_xform_vtx(s, &d, &vb[i], NULL);
         }
         trace_ati_r350_3d_vbuf_vtx((int32_t)(r300_f32(dw[0]) * 1000),
                                    (int32_t)(r300_f32(dw[1]) * 1000),
