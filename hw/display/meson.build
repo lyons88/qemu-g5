@@ -72,14 +72,20 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
 # optional dependency and QEMU's own SDL display owns the video subsystem
 # (see the win32 leg's comment in ati_r350_gl.c). Elsewhere the file
 # compiles to a stub that reports there is no backend.
+#
+# ati_r350_mtl.m is the second backend, Metal, selected at run time with
+# gl-api=metal (ati_r350_gpu.c holds whichever was opened). macOS only,
+# and it needs an Apple-silicon GPU for framebuffer fetch.
 r350_gl_deps = []
+r350_gl_srcs = files('ati_r350_gl.c', 'ati_r350_gpu.c')
 if host_os == 'darwin'
-  r350_gl_deps += dependency('appleframeworks', modules: 'OpenGL')
+  r350_gl_deps += dependency('appleframeworks', modules: ['OpenGL', 'Metal'])
+  r350_gl_srcs += files('ati_r350_mtl.m')
 elif host_os == 'windows'
   r350_gl_deps += [cc.find_library('opengl32'), cc.find_library('gdi32'),
                    cc.find_library('user32')]
 endif
-system_ss.add(when: 'CONFIG_ATI_R350', if_true: [files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c', 'ati_r350_pvs.c', 'ati_r350_pvs_glsl.c', 'ati_r350_us.c', 'ati_r350_us_glsl.c', 'ati_r350_gl.c'), r350_gl_deps])
+system_ss.add(when: 'CONFIG_ATI_R350', if_true: [files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c', 'ati_r350_pvs.c', 'ati_r350_pvs_glsl.c', 'ati_r350_us.c', 'ati_r350_us_glsl.c'), r350_gl_srcs, r350_gl_deps])
 
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])

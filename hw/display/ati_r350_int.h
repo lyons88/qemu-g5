@@ -638,6 +638,7 @@ struct ATIR350State {
      * interface and ati_r350_gl.c for the GL implementation of it.
      */
     char *gl_path;
+    char *gl_api;               /* "gl-api": opengl (default) or metal */
     ATIR350GlMode gl_mode;
     struct R350GlCtx *gl_ctx;
     uint64_t gl_drawn;          /* draws the backend rendered */

@@ -222,6 +222,10 @@ typedef struct R350GlReq {
      * and `us_konst` the thirty-two constant vectors the program may
      * name, uploaded per draw.
      *
+     * The Metal backend compiles this same text as Metal Shading
+     * Language, through a handful of aliases (see ati_r350_mtl.m), so
+     * the translator stays the single source for both.
+     *
      * Every draw carries one. The backend does not have a default: the
      * shading the caller wants is whatever the guest's program says, and
      * there is no arithmetic here that is not in that text.
@@ -240,6 +244,26 @@ typedef struct R350GlCtx R350GlCtx;
  */
 R350GlCtx *ati_r350_gl_open(const char **err);
 void ati_r350_gl_close(R350GlCtx *g);
+
+/*
+ * Create a backend on a named host API: "opengl" is ati_r350_gl.c,
+ * "metal" is ati_r350_mtl.m (macOS, Apple-silicon GPUs only). NULL or ""
+ * means "opengl", so ati_r350_gl_open() is this with no name. The
+ * dispatch between the two is ati_r350_gpu.c; each implementation is
+ * compiled with its own names for the entry points below, and nothing
+ * outside those three files can tell which one it is talking to.
+ */
+R350GlCtx *ati_r350_gl_open_api(const char *api, const char **err);
+
+/*
+ * True when the backend blends every primitive against what the one
+ * before it left at that pixel, in submission order, within ONE draw.
+ * Metal's framebuffer fetch on an Apple GPU is exactly that. The caller
+ * then partitions no self-overlapping blended draw into passes and never
+ * needs gl=fast's add-blend approximation: the draw is rendered in one
+ * go and still blends the way the device does.
+ */
+bool ati_r350_gl_ordered(R350GlCtx *g);
 
 /*
  * Size the resident render target to at least w x h. Returns false if

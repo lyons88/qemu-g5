@@ -4392,9 +4392,15 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                        s->gl_path);
             return;
         }
-        s->gl_ctx = ati_r350_gl_open(&why);
+        /*
+         * `gl-api` picks the host API underneath: opengl (the default)
+         * or metal. See ati_r350_gpu.c.
+         */
+        s->gl_ctx = ati_r350_gl_open_api(s->gl_api, &why);
         if (!s->gl_ctx) {
-            error_setg(errp, "gl=%s: %s", s->gl_path, why);
+            error_setg(errp, "gl=%s%s%s: %s", s->gl_path,
+                       s->gl_api ? ",gl-api=" : "",
+                       s->gl_api ? s->gl_api : "", why);
             return;
         }
         trace_ati_r350_gl_open(ati_r350_gl_describe(s->gl_ctx));
@@ -4636,6 +4642,7 @@ static const Property ati_r350_properties[] = {
      * "on", or "verify". See ati_r350_gl.h.
      */
     DEFINE_PROP_STRING("gl", ATIR350State, gl_path),
+    DEFINE_PROP_STRING("gl-api", ATIR350State, gl_api),
     /*
      * Diagnostic only (milestone M4): translate each vertex program the
      * guest uploads to GLSL and count whether the translator could
@@ -4996,6 +5003,14 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                                    PRIu64 " flushes, %" PRIu64 " waves",
                                    ati_r350_gl_barriers(s->gl_ctx),
                                    qu, qf, qw);
+        } else if (ati_r350_gl_ordered(s->gl_ctx)) {
+            uint64_t qu, qf, qw;
+
+            /* Metal: draws, command buffers, render passes */
+            ati_r350_gl_queue_stats(s->gl_ctx, &qu, &qf, &qw);
+            g_string_append_printf(out, "\nmetal: %" PRIu64 " draws in %"
+                                   PRIu64 " command buffers, %" PRIu64
+                                   " render passes", qu, qf, qw);
         }
     }
     if (s->gl_addblend) {

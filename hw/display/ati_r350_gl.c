@@ -72,7 +72,25 @@
  */
 
 #include "qemu/osdep.h"
-#include "ati_r350_gl.h"
+
+/*
+ * This file is the "opengl" backend. It is written against the names in
+ * ati_r350_gl.h and compiled under its own, r350_ogl_*, so that
+ * ati_r350_gpu.c can hold it or the Metal one behind the same interface.
+ */
+#define R350_GPU_IMPL_OGL 1
+#define R350GlCtx               R350OglCtx
+#define ati_r350_gl_open        r350_ogl_open
+#define ati_r350_gl_close       r350_ogl_close
+#define ati_r350_gl_target      r350_ogl_target
+#define ati_r350_gl_seed        r350_ogl_seed
+#define ati_r350_gl_fetch       r350_ogl_fetch
+#define ati_r350_gl_draw        r350_ogl_draw
+#define ati_r350_gl_describe    r350_ogl_describe
+#define ati_r350_gl_prog_stats  r350_ogl_prog_stats
+#define ati_r350_gl_barriers    r350_ogl_barriers
+#define ati_r350_gl_queue_stats r350_ogl_queue_stats
+#include "ati_r350_gpu.h"
 #include <float.h>
 #include <math.h>
 

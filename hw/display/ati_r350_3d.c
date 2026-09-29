@@ -6812,7 +6812,14 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     if (!r300_gl_clip(d, &req.sx0, &req.sy0, &req.sx1, &req.sy1)) {
         return r300_gl_fallback(s, R350_GLF_CLIPRULE, prim, nvtx);
     }
-    if (d->blend && d->blend_read && ntri > 1) {
+    /*
+     * A backend that blends each primitive against what the previous one
+     * left (Metal's framebuffer fetch: ati_r350_gl_ordered()) renders a
+     * self-overlapping blended draw in one go, exactly. No partition, no
+     * passes, and no add-blend approximation are needed for it.
+     */
+    if (d->blend && d->blend_read && ntri > 1 &&
+        !ati_r350_gl_ordered(s->gl_ctx)) {
         npass = ntri > R300_GL_TRI_MAX
                 ? 0 : r300_gl_passes(s, gvb, idx, ntri);
         /*
