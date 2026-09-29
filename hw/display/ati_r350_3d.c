@@ -215,6 +215,16 @@ typedef struct R300DrawState {
     unsigned zb_xr;
     /* d->vs with its operands decoded, for the per-vertex loop; or NULL */
     const R300PvsCompiled *vsc;
+    /*
+     * A texture unit's whole mip chain as one contiguous, uniformly
+     * swapped VRAM range, when it is one: then a texel is read straight
+     * from it instead of through the memory controller and the swapper.
+     */
+    struct {
+        bool ok;
+        uint32_t off, len;
+        unsigned xr;
+    } tvx[R300_TEX_UNITS];
 } R300DrawState;
 
 /*
@@ -498,12 +508,56 @@ static inline uint32_t r300_lane_xor32(uint32_t v, unsigned x)
 }
 
 /* the texel at card address `addr`, in the unit's format */
+/* a VRAM dword with the swapper already resolved */
+static inline uint32_t r300_ld32x(const R300DrawState *d, uint32_t addr,
+                                  unsigned xr)
+{
+    return (uint32_t)d->vram[addr ^ xr] |
+           ((uint32_t)d->vram[(addr + 1) ^ xr] << 8) |
+           ((uint32_t)d->vram[(addr + 2) ^ xr] << 16) |
+           ((uint32_t)d->vram[(addr + 3) ^ xr] << 24);
+}
+
 static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
                             unsigned unit, uint32_t addr)
 {
     const R300TexUnit *u = &d->tex[unit];
     uint32_t off;
 
+    if (d->tvx[unit].ok && addr - u->off < d->tvx[unit].len) {
+        /*
+         * The resolved chain: the same bytes the paths below read, found
+         * without a memory-controller walk, a RAM-block lookup and a
+         * swapper resolve per texel (a fifth of the raster threads' time
+         * on OpenMark).
+         */
+        unsigned x = d->tvx[unit].xr;
+        uint32_t o = d->tvx[unit].off + (addr - u->off);
+        const uint8_t *m = d->vram;
+
+        switch (u->bpp) {
+        case 8:
+            return m[o ^ (x & 3)];
+        case 16: {
+            uint32_t v = (uint32_t)m[o ^ x] | ((uint32_t)m[(o + 1) ^ x] << 8);
+
+            switch (u->code) {
+            case R300_TX_FMT_1_5_5_5:
+                return r300_texel_1555(v);
+            case R300_TX_FMT_5_6_5:
+                return r300_texel_565(v);
+            case R300_TX_FMT_4_4_4_4:
+                return r300_texel_4444(v);
+            default:
+                return v;
+            }
+        }
+        case 64:
+            return r300_texel_16x4(r300_ld32x(d, o, x), r300_ld32x(d, o + 4, x));
+        default:
+            return r300_ld32x(d, o, x);
+        }
+    }
     if (u->bpp == 8) {
         /* single-component format: the byte is component X */
         uint8_t a;
@@ -895,16 +949,6 @@ static inline uint32_t r300_ld32(ATIR350State *s, const R300DrawState *d,
 {
     unsigned xr = ati_r350_vram_xor(s, addr);
 
-    return (uint32_t)d->vram[addr ^ xr] |
-           ((uint32_t)d->vram[(addr + 1) ^ xr] << 8) |
-           ((uint32_t)d->vram[(addr + 2) ^ xr] << 16) |
-           ((uint32_t)d->vram[(addr + 3) ^ xr] << 24);
-}
-
-/* the same, with the swapper already resolved */
-static inline uint32_t r300_ld32x(const R300DrawState *d, uint32_t addr,
-                                  unsigned xr)
-{
     return (uint32_t)d->vram[addr ^ xr] |
            ((uint32_t)d->vram[(addr + 1) ^ xr] << 8) |
            ((uint32_t)d->vram[(addr + 2) ^ xr] << 16) |
@@ -1810,6 +1854,17 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
         y1 = yhi + 1;
     }
 
+    /*
+     * The written extent of the whole triangle, marked dirty ONCE after
+     * the scan. Per row it was a dirty-bitmap update for every row of
+     * every triangle -- three atomic bitmaps each, 1,351 samples in ten
+     * seconds of OpenMark across the raster threads. One range spanning
+     * the rows also marks the pixels between them on those rows, which
+     * costs the display a redraw of pixels that did not change and never
+     * the other way round.
+     */
+    uint64_t tri_lo = UINT64_MAX, tri_hi = 0;
+
     for (y = y0; y < y1; y++) {
         float py = y + 0.5f;
         float ry0 = py - v1->y, ry1 = py - v2->y, ry2 = py - v0->y;
@@ -2212,8 +2267,12 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
             uint64_t lo = dirty_lo & ~7ull;
             uint64_t hi = (dirty_hi + d->cb_bpp + 7) & ~7ull;
 
-            memory_region_set_dirty(&s->vram, lo, hi - lo);
+            tri_lo = MIN(tri_lo, lo);
+            tri_hi = MAX(tri_hi, hi);
         }
+    }
+    if (tri_hi > tri_lo) {
+        memory_region_set_dirty(&s->vram, tri_lo, tri_hi - tri_lo);
     }
 }
 
@@ -4458,6 +4517,27 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      * again for every vertex: the command processor's largest cost on
      * OpenMark once clears and the swapper were out of the way.
      */
+    {
+        unsigned tu;
+
+        for (tu = 0; tu < R300_TEX_UNITS; tu++) {
+            const R300TexUnit *u = &d->tex[tu];
+            uint32_t o0, o1;
+
+            d->tvx[tu].ok = false;
+            if (u->en && u->chain &&
+                ati_r350_mc_to_vram(s, u->off, &o0) &&
+                ati_r350_mc_to_vram(s, u->off + u->chain - 1, &o1) &&
+                o1 == o0 + u->chain - 1 &&
+                (uint64_t)o0 + u->chain + 8 <= ATI_R350_VRAM_SIZE &&
+                ati_r350_vram_xor_span(s, o0, u->chain + 8,
+                                       &d->tvx[tu].xr)) {
+                d->tvx[tu].ok = true;
+                d->tvx[tu].off = o0;
+                d->tvx[tu].len = u->chain;
+            }
+        }
+    }
     d->vsc = NULL;
     if (d->vs_run && d->vs.valid && !d->vs.plain_matrix) {
         if (!s->pvs_cc) {
