@@ -853,6 +853,7 @@ struct ATIR350State {
     uint32_t pvs_const[R300_PVS_CONST_SLOTS * 4];
     uint32_t pvs_const_dwords;
     uint32_t pvs_code[R300_PVS_CODE_SLOTS * 4];
+    R300PvsCompiled *pvs_cc;    /* the draw in hand's program, decoded */
     uint32_t pvs_code_slot_valid[R300_PVS_CODE_SLOTS / 32];
     /* dwords ever uploaded to the code region: is there a program at all */
     uint32_t pvs_code_dwords;

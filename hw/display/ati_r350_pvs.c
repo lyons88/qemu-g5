@@ -317,37 +317,32 @@ static void r300_pvs_dual_math(const R300PvsProgram *p, R300PvsRegs *r,
     r->atmp[doff][c] = res[c];
 }
 
-void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps)
+/*
+ * One instruction, its sources already read. The dual-issue math half
+ * runs here, after `a` and `b` were read and before the vector half
+ * writes -- the order the plain interpreter has always used.
+ */
+static inline void r300_pvs_ins(const R300PvsProgram *p, R300PvsRegs *r,
+                                R300PvsGaps *gaps, const uint32_t *w,
+                                const float a[4], const float b[4],
+                                const float c[4])
 {
-    unsigned i;
+    uint32_t op = w[0];
+    unsigned opcode = op & R300_PVS_DST_OPCODE_MASK;
+    bool math = op & R300_PVS_DST_MATH_INST;
+    unsigned dtype = (op >> R300_PVS_DST_REG_TYPE_SHIFT) &
+                     R300_PVS_DST_REG_TYPE_MASK;
+    unsigned doff = (op >> R300_PVS_DST_OFFSET_SHIFT) &
+                    R300_PVS_DST_OFFSET_MASK;
+    unsigned we = (op >> R300_PVS_DST_WE_SHIFT) & R300_PVS_DST_WE_MASK;
+    float res[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float *dst;
+    unsigned k;
 
-    if (!p->valid) {
-        return;
+    if (op & R300_PVS_DST_DUAL_MATH_OP) {
+        r300_pvs_dual_math(p, r, w[3], gaps);
     }
-    for (i = p->first; i <= p->last; i++) {
-        const uint32_t *w = &p->code[i * 4];
-        uint32_t op = w[0];
-        unsigned opcode = op & R300_PVS_DST_OPCODE_MASK;
-        bool math = op & R300_PVS_DST_MATH_INST;
-        bool dual = op & R300_PVS_DST_DUAL_MATH_OP;
-        unsigned dtype = (op >> R300_PVS_DST_REG_TYPE_SHIFT) &
-                         R300_PVS_DST_REG_TYPE_MASK;
-        unsigned doff = (op >> R300_PVS_DST_OFFSET_SHIFT) &
-                        R300_PVS_DST_OFFSET_MASK;
-        unsigned we = (op >> R300_PVS_DST_WE_SHIFT) & R300_PVS_DST_WE_MASK;
-        float a[4], b[4], c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        float res[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        float *dst;
-        unsigned k;
-
-        r300_pvs_src(p, r, w[1], a);
-        r300_pvs_src(p, r, w[2], b);
-        if (dual) {
-            r300_pvs_dual_math(p, r, w[3], gaps);
-        } else {
-            r300_pvs_src(p, r, w[3], c);
-        }
-
+    do {
         if (op & R300_PVS_DST_MACRO_INST) {
             /*
              * The macro bit only ever marks a multiply-add whose three
@@ -360,25 +355,25 @@ void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps)
             }
         } else if (math) {
             if (opcode == R300_ME_NO_OP) {
-                continue;
+                return;
             }
             if (!r300_pvs_math(opcode, a, b, c, res)) {
                 if (gaps && !gaps->has_math_op) {
                     gaps->has_math_op = true;
                     gaps->math_op = opcode;
                 }
-                continue;
+                return;
             }
         } else {
             if (opcode == R300_VE_NO_OP) {
-                continue;
+                return;
             }
             if (!r300_pvs_vector(opcode, a, b, c, res)) {
                 if (gaps && !gaps->has_vec_op) {
                     gaps->has_vec_op = true;
                     gaps->vec_op = opcode;
                 }
-                continue;
+                return;
             }
         }
 
@@ -411,7 +406,7 @@ void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps)
                 gaps->has_dst_file = true;
                 gaps->dst_file = dtype;
             }
-            continue;
+            return;
         }
         for (k = 0; k < 4; k++) {
             if (we & (1u << k)) {
@@ -419,6 +414,158 @@ void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps)
                          res[0] : res[k];
             }
         }
+    } while (0);
+}
+
+void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps)
+{
+    unsigned i;
+
+    if (!p->valid) {
+        return;
+    }
+    for (i = p->first; i <= p->last; i++) {
+        const uint32_t *w = &p->code[i * 4];
+        float a[4], b[4], c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+        r300_pvs_src(p, r, w[1], a);
+        r300_pvs_src(p, r, w[2], b);
+        if (!(w[0] & R300_PVS_DST_DUAL_MATH_OP)) {
+            r300_pvs_src(p, r, w[3], c);
+        }
+        r300_pvs_ins(p, r, gaps, w, a, b, c);
+    }
+}
+
+/*
+ * THE COMPILED FORM. r300_pvs_run() decodes every operand's register
+ * file, offset, four swizzles, abs and negate -- and converts and bounds
+ * checks every constant -- for every instruction of every vertex. None
+ * of that changes within a draw, so it is done once per draw here and
+ * the per-vertex loop reads decoded operands; a constant operand is
+ * stored finished, swizzle and modifiers applied. The arithmetic is
+ * r300_pvs_ins(), shared with the interpreter, so the two cannot drift.
+ */
+static void r300_pvs_csrc_make(const R300PvsProgram *p, uint32_t dw,
+                               R300PvsCSrc *o)
+{
+    unsigned type = dw & R300_PVS_SRC_REG_TYPE_MASK;
+    unsigned off = (dw >> R300_PVS_SRC_OFFSET_SHIFT) &
+                   R300_PVS_SRC_OFFSET_MASK;
+    unsigned c;
+
+    o->abs = (dw & R300_PVS_SRC_ABS_XYZW) != 0;
+    o->neg = 0;
+    for (c = 0; c < 4; c++) {
+        o->sel[c] = (dw >> (R300_PVS_SRC_SWIZZLE_SHIFT + 3 * c)) &
+                    R300_PVS_SRC_SWIZZLE_MASK;
+        if ((dw >> (R300_PVS_SRC_MODIFIER_SHIFT + c)) & 1) {
+            o->neg |= 1u << c;
+        }
+    }
+    switch (type) {
+    case R300_PVS_SRC_REG_INPUT:
+        o->file = 0;
+        o->idx = off % R300_PVS_IN_REGS;
+        break;
+    case R300_PVS_SRC_REG_CONSTANT:
+        o->file = 1;
+        o->idx = 0;
+        /* the whole operand, exactly as r300_pvs_src() would finish it */
+        {
+            static const R300PvsRegs none;
+
+            r300_pvs_src(p, &none, dw, o->kv);
+        }
+        break;
+    case R300_PVS_SRC_REG_ALT_TEMP:
+        o->file = 2;
+        o->idx = off % R300_PVS_ATMP_REGS;
+        break;
+    default:
+        o->file = 3;
+        o->idx = off % R300_PVS_TMP_REGS;
+        break;
+    }
+}
+
+static inline void r300_pvs_csrc(const R300PvsCSrc *o, const R300PvsRegs *r,
+                                 float out[4])
+{
+    const float *v;
+    unsigned c;
+
+    switch (o->file) {
+    case 1:
+        memcpy(out, o->kv, sizeof(o->kv));
+        return;
+    case 0:
+        v = r->in[o->idx];
+        break;
+    case 2:
+        v = r->atmp[o->idx];
+        break;
+    default:
+        v = r->tmp[o->idx];
+        break;
+    }
+    for (c = 0; c < 4; c++) {
+        unsigned sel = o->sel[c];
+        float f;
+
+        if (sel < 4) {
+            f = v[sel];
+        } else {
+            f = sel == R300_PVS_SRC_SELECT_FORCE_1 ? 1.0f : 0.0f;
+        }
+        if (o->abs) {
+            f = fabsf(f);
+        }
+        if ((o->neg >> c) & 1) {
+            f = -f;
+        }
+        out[c] = f;
+    }
+}
+
+void r300_pvs_compile(const R300PvsProgram *p, R300PvsCompiled *cp)
+{
+    unsigned i;
+
+    cp->p = p;
+    cp->n = 0;
+    if (!p->valid) {
+        return;
+    }
+    for (i = p->first; i <= p->last && cp->n < R300_PVS_CODE_SLOTS; i++) {
+        const uint32_t *w = &p->code[i * 4];
+        R300PvsCIns *in = &cp->ins[cp->n++];
+
+        in->w = w;
+        r300_pvs_csrc_make(p, w[1], &in->a);
+        r300_pvs_csrc_make(p, w[2], &in->b);
+        in->dual = (w[0] & R300_PVS_DST_DUAL_MATH_OP) != 0;
+        if (!in->dual) {
+            r300_pvs_csrc_make(p, w[3], &in->c);
+        }
+    }
+}
+
+void r300_pvs_exec(const R300PvsCompiled *cp, R300PvsRegs *r,
+                   R300PvsGaps *gaps)
+{
+    unsigned i;
+
+    for (i = 0; i < cp->n; i++) {
+        const R300PvsCIns *in = &cp->ins[i];
+        float a[4], b[4], c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+        r300_pvs_csrc(&in->a, r, a);
+        r300_pvs_csrc(&in->b, r, b);
+        if (!in->dual) {
+            r300_pvs_csrc(&in->c, r, c);
+        }
+        r300_pvs_ins(cp->p, r, gaps, in->w, a, b, c);
     }
 }
 

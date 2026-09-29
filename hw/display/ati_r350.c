@@ -4625,6 +4625,7 @@ static void ati_r350_exit(PCIDevice *dev)
     g_free(s->gl_texbuf);
     g_free(s->gl_verts);
     g_free(s->gl_zstage);
+    g_free(s->pvs_cc);
     if (s->agp_as_valid) {
         address_space_destroy(&s->agp_as);
         s->agp_as_valid = false;
