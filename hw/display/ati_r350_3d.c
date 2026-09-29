@@ -7089,6 +7089,17 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         ntri = r300_gl_tris(prim, nvtx, idx, nvtx * 3 + 3);
     }
     if (!ntri) {
+        /*
+         * A point list expands to nothing only when RE_POINTSIZE is zero
+         * in either direction, and r300_raster_prims()'s case 1 then
+         * paints nothing either -- its loop has the same `sx > 0 && sy >
+         * 0` guard. That is a proof of emptiness, so the resident target
+         * stays put. OpenMark issues thousands of these; each one used
+         * to flush and re-seed the whole screen for no pixels at all.
+         */
+        if (prim == 1) {
+            return r300_gl_nowork(s, R350_GLF_PRIM, prim, nvtx);
+        }
         return r300_gl_fallback(s, R350_GLF_PRIM, prim, nvtx);
     }
     if (prim != 8 && prim != 1 &&
