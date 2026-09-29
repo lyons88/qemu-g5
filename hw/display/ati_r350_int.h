@@ -1108,6 +1108,8 @@ void ati_r350_host_cursor(int x, int y, bool on);
  * swap, 1 = 16-bit swap, 3 = 32-bit swap. See ati_r350_vram_xor().
  */
 unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off);
+bool ati_r350_vram_xor_span(ATIR350State *s, uint32_t off, uint32_t len,
+                            unsigned *xr);
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off);
 
 #endif /* ATI_R350_INT_H */

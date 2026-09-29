@@ -276,6 +276,26 @@ unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off)
     return m->val;
 }
 
+/*
+ * The swapper lane mask for EVERY byte of [off, off + len), or false if
+ * the range straddles surfaces with different swaps. One walk of the
+ * eight surfaces, so a draw can resolve its colour and depth buffers
+ * once instead of once per pixel -- the per-pixel lookup was the
+ * software rasterizer's single hottest function on OpenMark.
+ */
+bool ati_r350_vram_xor_span(ATIR350State *s, uint32_t off, uint32_t len,
+                            unsigned *xr)
+{
+    ATIR350SwapMemo m;
+
+    ati_r350_swap_resolve(s, off, &m);
+    if ((uint64_t)off + (len ? len : 1) - 1 > m.hi) {
+        return false;
+    }
+    *xr = m.val;
+    return true;
+}
+
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off)
 {
     const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
