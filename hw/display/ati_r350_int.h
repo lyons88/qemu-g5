@@ -644,7 +644,7 @@ struct ATIR350State {
      * "gl-sync": `strict` is Cat_7's rule, every burst ends the
      * residency; `lazy` keeps the target on the GPU across bursts and
      * hands it back only when something is known to look. See "LAZY
-     * RESIDENCY" in ati_r350_3d.c. Default: lazy on Metal, strict else.
+     * RESIDENCY" in ati_r350_3d.c. Default: strict.
      */
     char *gl_sync;
     bool gl_lazy;

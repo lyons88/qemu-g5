@@ -500,8 +500,16 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
 
     if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
-        CGFloat width = screen.width / [[self window] backingScaleFactor];
-        CGFloat height = screen.height / [[self window] backingScaleFactor];
+        /*
+         * One guest pixel per POINT, not per device pixel: on a Retina
+         * display dividing by the backing scale made a 1280x768 guest a
+         * 640x384 window. The view's bounds are the guest size, so this
+         * draws each guest pixel as a crisp 2x2 block at the size the
+         * guest resolution actually is, and the window follows every
+         * mode change.
+         */
+        CGFloat width = screen.width;
+        CGFloat height = screen.height;
 
         [[self window] setContentSize:NSMakeSize(width, height)];
         [[self window] center];

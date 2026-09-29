@@ -4406,7 +4406,12 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
         trace_ati_r350_gl_open(ati_r350_gl_describe(s->gl_ctx));
     }
     s->gl_pgbits = qemu_target_page_bits();
-    s->gl_lazy = s->gl_ctx && ati_r350_gl_depth(s->gl_ctx);
+    /*
+     * Strict unless asked: lazy residency flushed stale GPU copies over
+     * VRAM the guest CPU had since reused (menu bar and window garbage
+     * on a Tiger desktop), because CPU stores to VRAM cannot be trapped.
+     */
+    s->gl_lazy = false;
     if (s->gl_sync && s->gl_sync[0]) {
         if (!strcmp(s->gl_sync, "lazy")) {
             s->gl_lazy = true;
