@@ -99,6 +99,33 @@ bool ati_r350_gl_ordered(R350GlCtx *g)
     return g && g->api == R350_GPU_MTL;
 }
 
+bool ati_r350_gl_depth(R350GlCtx *g)
+{
+    return g && g->api == R350_GPU_MTL;
+}
+
+bool ati_r350_gl_zseed(R350GlCtx *g, int x0, int y0, int w, int h,
+                       const uint32_t *z)
+{
+#ifdef CONFIG_DARWIN
+    if (g && g->api == R350_GPU_MTL) {
+        return r350_mtl_zseed(g->mtl, x0, y0, w, h, z);
+    }
+#endif
+    return false;
+}
+
+bool ati_r350_gl_zfetch(R350GlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t *z)
+{
+#ifdef CONFIG_DARWIN
+    if (g && g->api == R350_GPU_MTL) {
+        return r350_mtl_zfetch(g->mtl, x0, y0, w, h, z);
+    }
+#endif
+    return false;
+}
+
 bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost)
 {
     if (!g) {

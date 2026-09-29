@@ -50,6 +50,11 @@ R350_GPU_DECLARE(R350OglCtx, r350_ogl)
 
 #if defined(CONFIG_DARWIN) && !defined(R350_GPU_IMPL_MTL)
 R350_GPU_DECLARE(R350MtlCtx, r350_mtl)
+/* the depth buffer, which only the Metal backend has */
+bool r350_mtl_zseed(R350MtlCtx *g, int x0, int y0, int w, int h,
+                    const uint32_t *z);
+bool r350_mtl_zfetch(R350MtlCtx *g, int x0, int y0, int w, int h,
+                     uint32_t *z);
 #endif
 
 #endif /* ATI_R350_GPU_H */

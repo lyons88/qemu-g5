@@ -1045,34 +1045,42 @@ static void r300_st32(ATIR350State *s, const R300DrawState *d,
  * bit back to x (4x2 micro block, 8x8 per macro block); no guest has
  * read one back, so it is unmeasured.
  */
-static uint32_t r300_zb_addr(const ATIR350State *s, unsigned x, unsigned y,
-                             unsigned sample)
+static uint32_t r300_zaddr(uint32_t off, uint32_t pitch, bool macro,
+                           unsigned micro, bool aa, unsigned x, unsigned y,
+                           unsigned sample)
 {
     uint32_t a;
 
-    if (!s->zb.macro && !s->zb.micro) {
-        return s->zb.off + ((uint32_t)y * s->zb.pitch + x) * 4;
+    if (!macro && !micro) {
+        return off + ((uint32_t)y * pitch + x) * 4;
     }
-    if (s->zb.aa) {
+    if (aa) {
         a = ((x & 1) << 2) | ((y & 1) << 3) | (sample << 4);
-        if (s->zb.macro) {
+        if (macro) {
             a |= (((x >> 1) & 1) << 5) | (((y >> 1) & 3) << 6) |
                  (((x >> 2) & 7) << 8);
-            a += ((y >> 3) * (s->zb.pitch / 32) + (x >> 5)) * 2048;
+            a += ((y >> 3) * (pitch / 32) + (x >> 5)) * 2048;
         } else {
-            a += ((y >> 1) * (s->zb.pitch / 2) + (x >> 1)) * 32;
+            a += ((y >> 1) * (pitch / 2) + (x >> 1)) * 32;
         }
     } else {
         a = ((x & 1) << 2) | (((x >> 1) & 1) << 3) | ((y & 1) << 4);
-        if (s->zb.macro) {
+        if (macro) {
             a |= (((x >> 2) & 1) << 5) | (((y >> 1) & 3) << 6) |
                  (((x >> 3) & 3) << 8) | (((y >> 3) & 1) << 10);
-            a += ((y >> 4) * (s->zb.pitch / 32) + (x >> 5)) * 2048;
+            a += ((y >> 4) * (pitch / 32) + (x >> 5)) * 2048;
         } else {
-            a += ((y >> 1) * (s->zb.pitch / 4) + (x >> 2)) * 32;
+            a += ((y >> 1) * (pitch / 4) + (x >> 2)) * 32;
         }
     }
-    return s->zb.off + a;
+    return off + a;
+}
+
+static uint32_t r300_zb_addr(const ATIR350State *s, unsigned x, unsigned y,
+                             unsigned sample)
+{
+    return r300_zaddr(s->zb.off, s->zb.pitch, s->zb.macro, s->zb.micro,
+                      s->zb.aa, x, y, sample);
 }
 
 /* ZFUNC / STENCILFUNC: `a` is the incoming value, `b` the stored one */
@@ -1180,6 +1188,8 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
  * pixels (8x4 tiles of 4x4 on two pipes), row-major over
  * ZB_ZMASK_PITCH pixels: a 640x480 clear is 600 dwords.
  */
+static void r300_gl_zrelease(ATIR350State *s, ATIR350GlRel why);
+
 void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
                                uint32_t val)
 {
@@ -1198,6 +1208,8 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
                              &off)) {
         return;
     }
+    /* this writes the depth buffer in VRAM: a resident copy goes back */
+    r300_gl_zrelease(s, R350_GLR_ZCLEAR);
     s->zb.off = off;
     s->zb.pitch = ((zp >> 2) & 0xfff) * 4;
     s->zb.macro = zp & R300_ZB_MACROTILE;
@@ -5394,6 +5406,263 @@ static void r300_gl_discard(ATIR350State *s)
     s->gl_vx0 = s->gl_vx1 = s->gl_vy0 = s->gl_vy1 = 0;
 }
 
+/*
+ * =====================================================================
+ * GL-OWNED DEPTH BUFFER
+ * =====================================================================
+ *
+ * For a backend with a depth buffer of its own (ati_r350_gl_depth(),
+ * i.e. Metal), the Z buffer is resident on the host GPU beside the
+ * colour target and under EXACTLY the colour target's rules: it is
+ * resident only while the colour target is (`gl_zres` implies
+ * `gl_res`), so every hook listed above -- scanout, the 2D engine, the
+ * CP, MM_DATA, fallbacks, texture reads, reset, and above all the end of
+ * every burst -- flushes it and gives it back through the same
+ * ati_r350_gl_release(). ati_r350_gl_sync() tests its VRAM span as well
+ * as the colour target's.
+ *
+ * What moves is one Z word per pixel as r300_zb_pixel() reads it --
+ * (z24 << 8) | stencil through the swapper at r300_zaddr(), or the
+ * linear 16-bit Z -- so the backend never sees tiling. Seeding reads
+ * sample 0. Flushing writes a word only where it differs from VRAM, and
+ * to both samples of a two-sample buffer, as r300_zb_pixel() does.
+ *
+ * The one Z WRITER outside the draw path is 3D_CLEAR_ZMASK, which
+ * writes VRAM directly: it flushes and drops the resident depth
+ * buffer first (R350_GLR_ZCLEAR), leaving the colour target resident.
+ */
+static const char r300_gl_zonly_us[] =
+    "void us_main(vec4 tex0, vec4 col0, vec4 col1,\n"
+    "             out vec4 outc)\n"
+    "{\n"
+    "    outc = col0;\n"
+    "}\n";
+#define R300_GL_ZONLY_KEY 0x7a6f6e6c79000001ull
+
+/* the VRAM bytes the resident depth buffer can occupy; empty when none */
+static bool r300_gl_zspan(ATIR350State *s, uint32_t *lo, uint32_t *hi)
+{
+    uint64_t end;
+
+    if (!s->gl_zres || s->gl_zvy1 <= s->gl_zvy0) {
+        return false;
+    }
+    end = s->gl_z_off + QEMU_ALIGN_UP((uint64_t)s->gl_zvy1, 16) *
+          s->gl_z_pitch * (s->gl_z_z16 ? 2 : 4) * (s->gl_z_aa ? 2 : 1);
+    *lo = s->gl_z_off;
+    *hi = (uint32_t)MIN(end, (uint64_t)ATI_R350_VRAM_SIZE);
+    return true;
+}
+
+static bool r300_gl_zload(ATIR350State *s, const uint8_t *vram,
+                          unsigned x, unsigned y, uint32_t *v)
+{
+    uint32_t a;
+    unsigned xr;
+
+    if (s->gl_z_z16) {
+        a = s->gl_z_off + ((uint32_t)y * s->gl_z_pitch + x) * 2;
+        if (a + 2 > ATI_R350_VRAM_SIZE) {
+            return false;
+        }
+        xr = ati_r350_vram_xor(s, a);
+        *v = vram[a ^ xr] | (uint32_t)vram[(a + 1) ^ xr] << 8;
+        return true;
+    }
+    a = r300_zaddr(s->gl_z_off, s->gl_z_pitch, s->gl_z_macro, s->gl_z_micro,
+                   s->gl_z_aa, x, y, 0);
+    if (a + 4 > ATI_R350_VRAM_SIZE) {
+        return false;
+    }
+    xr = ati_r350_vram_xor(s, a);
+    *v = (uint32_t)vram[a ^ xr] | (uint32_t)vram[(a + 1) ^ xr] << 8 |
+         (uint32_t)vram[(a + 2) ^ xr] << 16 |
+         (uint32_t)vram[(a + 3) ^ xr] << 24;
+    return true;
+}
+
+static void r300_gl_zstore(ATIR350State *s, uint8_t *vram,
+                           unsigned x, unsigned y, uint32_t v)
+{
+    unsigned k, xr;
+    uint32_t a;
+
+    if (s->gl_z_z16) {
+        a = s->gl_z_off + ((uint32_t)y * s->gl_z_pitch + x) * 2;
+        xr = ati_r350_vram_xor(s, a);
+        vram[a ^ xr] = v & 0xff;
+        vram[(a + 1) ^ xr] = (v >> 8) & 0xff;
+        return;
+    }
+    for (k = 0; k < (s->gl_z_aa ? 2u : 1u); k++) {
+        a = r300_zaddr(s->gl_z_off, s->gl_z_pitch, s->gl_z_macro,
+                       s->gl_z_micro, s->gl_z_aa, x, y, k);
+        if (a + 4 > ATI_R350_VRAM_SIZE) {
+            continue;
+        }
+        xr = ati_r350_vram_xor(s, a);
+        vram[(a + 0) ^ xr] = v & 0xff;
+        vram[(a + 1) ^ xr] = (v >> 8) & 0xff;
+        vram[(a + 2) ^ xr] = (v >> 16) & 0xff;
+        vram[(a + 3) ^ xr] = (v >> 24) & 0xff;
+    }
+}
+
+static uint32_t *r300_gl_zstage(ATIR350State *s, size_t n)
+{
+    if (n > s->gl_zstage_n) {
+        s->gl_zstage = g_renew(uint32_t, s->gl_zstage, n);
+        s->gl_zstage_n = n;
+    }
+    return s->gl_zstage;
+}
+
+/* the host GPU's newer depth words, back into VRAM */
+static void r300_gl_zflush(ATIR350State *s)
+{
+    uint8_t *vram;
+    uint32_t *st;
+    int x, y, w, h;
+
+    if (!s->gl_zres || s->gl_zdx1 <= s->gl_zdx0 || s->gl_zdy1 <= s->gl_zdy0) {
+        return;
+    }
+    w = s->gl_zdx1 - s->gl_zdx0;
+    h = s->gl_zdy1 - s->gl_zdy0;
+    st = r300_gl_zstage(s, (size_t)w * h);
+    vram = memory_region_get_ram_ptr(&s->vram);
+    if (ati_r350_gl_zfetch(s->gl_ctx, s->gl_zdx0, s->gl_zdy0, w, h, st)) {
+        for (y = 0; y < h; y++) {
+            for (x = 0; x < w; x++) {
+                unsigned px = s->gl_zdx0 + x, py = s->gl_zdy0 + y;
+                uint32_t old;
+
+                if (r300_gl_zload(s, vram, px, py, &old) &&
+                    old != st[(size_t)y * w + x]) {
+                    r300_gl_zstore(s, vram, px, py, st[(size_t)y * w + x]);
+                }
+            }
+        }
+        s->gl_zflushes++;
+        s->gl_zflush_px += (uint64_t)w * h;
+    }
+    s->gl_zdx0 = s->gl_zdx1 = s->gl_zdy0 = s->gl_zdy1 = 0;
+}
+
+/* stop trusting the GPU's depth buffer, WITHOUT writing it back */
+static void r300_gl_zdiscard(ATIR350State *s)
+{
+    s->gl_zres = false;
+    s->gl_zdx0 = s->gl_zdx1 = s->gl_zdy0 = s->gl_zdy1 = 0;
+    s->gl_zvx0 = s->gl_zvx1 = s->gl_zvy0 = s->gl_zvy1 = 0;
+}
+
+/* the depth buffer alone goes back; the colour target stays resident */
+static void r300_gl_zrelease(ATIR350State *s, ATIR350GlRel why)
+{
+    uint64_t px;
+
+    if (!ati_r350_gl_mine(s) || !s->gl_zres) {
+        return;
+    }
+    px = s->gl_zflush_px;
+    r300_gl_zflush(s);
+    r300_gl_zdiscard(s);
+    s->gl_rel[why]++;
+    s->gl_rel_px[why] += s->gl_zflush_px - px;
+}
+
+/* seed [x0,x1) x [y0,y1) of the depth buffer from VRAM */
+static bool r300_gl_zseed_rect(ATIR350State *s, int x0, int y0,
+                               int x1, int y1)
+{
+    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    int w = x1 - x0, h = y1 - y0, x, y;
+    uint32_t *st;
+
+    if (w <= 0 || h <= 0) {
+        return true;
+    }
+    st = r300_gl_zstage(s, (size_t)w * h);
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint32_t v = 0;
+
+            r300_gl_zload(s, vram, x0 + x, y0 + y, &v);
+            st[(size_t)y * w + x] = v;
+        }
+    }
+    if (!ati_r350_gl_zseed(s->gl_ctx, x0, y0, w, h, st)) {
+        return false;
+    }
+    s->gl_zseed_px += (uint64_t)w * h;
+    return true;
+}
+
+/*
+ * Make the draw's Z buffer (s->zb) the resident one and make sure the
+ * GPU holds [x0,x1) x [y0,y1) of it -- r300_gl_bind()'s scheme, for the
+ * depth buffer: the bounding rectangle minus what is already seeded, as
+ * up to four strips. Called after r300_gl_bind(), so the colour target
+ * is resident and the backend's buffers are big enough.
+ */
+static bool r300_gl_zbind(ATIR350State *s, int x0, int y0, int x1, int y1)
+{
+    struct { int x0, y0, x1, y1; } strip[4];
+    int ux0, uy0, ux1, uy1;
+    unsigned k, n = 0;
+
+    if (s->gl_zres && (s->gl_z_off != s->zb.off ||
+                       s->gl_z_pitch != s->zb.pitch ||
+                       s->gl_z_macro != s->zb.macro ||
+                       s->gl_z_micro != s->zb.micro ||
+                       s->gl_z_aa != s->zb.aa ||
+                       s->gl_z_z16 != s->zb.z16)) {
+        /* another depth buffer entirely */
+        r300_gl_zflush(s);
+        r300_gl_zdiscard(s);
+    }
+    if (!s->gl_zres) {
+        s->gl_zres = true;
+        s->gl_z_off = s->zb.off;
+        s->gl_z_pitch = s->zb.pitch;
+        s->gl_z_macro = s->zb.macro;
+        s->gl_z_micro = s->zb.micro;
+        s->gl_z_aa = s->zb.aa;
+        s->gl_z_z16 = s->zb.z16;
+    }
+    if (s->gl_zvx1 > s->gl_zvx0 && x0 >= s->gl_zvx0 && y0 >= s->gl_zvy0 &&
+        x1 <= s->gl_zvx1 && y1 <= s->gl_zvy1) {
+        return true;
+    }
+    if (s->gl_zvx1 <= s->gl_zvx0) {
+        ux0 = x0; uy0 = y0; ux1 = x1; uy1 = y1;
+        strip[n].x0 = ux0; strip[n].y0 = uy0;
+        strip[n].x1 = ux1; strip[n].y1 = uy1; n++;
+    } else {
+        ux0 = MIN(s->gl_zvx0, x0); uy0 = MIN(s->gl_zvy0, y0);
+        ux1 = MAX(s->gl_zvx1, x1); uy1 = MAX(s->gl_zvy1, y1);
+        strip[n].x0 = ux0; strip[n].y0 = uy0;
+        strip[n].x1 = ux1; strip[n].y1 = s->gl_zvy0; n++;
+        strip[n].x0 = ux0; strip[n].y0 = s->gl_zvy1;
+        strip[n].x1 = ux1; strip[n].y1 = uy1; n++;
+        strip[n].x0 = ux0; strip[n].y0 = s->gl_zvy0;
+        strip[n].x1 = s->gl_zvx0; strip[n].y1 = s->gl_zvy1; n++;
+        strip[n].x0 = s->gl_zvx1; strip[n].y0 = s->gl_zvy0;
+        strip[n].x1 = ux1; strip[n].y1 = s->gl_zvy1; n++;
+    }
+    for (k = 0; k < n; k++) {
+        if (!r300_gl_zseed_rect(s, strip[k].x0, strip[k].y0,
+                                strip[k].x1, strip[k].y1)) {
+            ati_r350_gl_release(s, R350_GLR_BACKEND);
+            return false;
+        }
+    }
+    s->gl_zvx0 = ux0; s->gl_zvy0 = uy0;
+    s->gl_zvx1 = ux1; s->gl_zvy1 = uy1;
+    return true;
+}
+
 static void r300_gl_texdrop(ATIR350State *s)
 {
     unsigned k;
@@ -5417,6 +5686,7 @@ static const char *const r300_gl_rel_names[R350_GLR_MAX] = {
     [R350_GLR_BACKEND]  = "backend declined",
     [R350_GLR_RESET]    = "reset",
     [R350_GLR_FENCE]    = "fence",
+    [R350_GLR_ZCLEAR]   = "Z clear",
 };
 
 const char *ati_r350_gl_rel_name(ATIR350GlRel why)
@@ -5585,6 +5855,8 @@ void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
         return;
     }
     px = s->gl_flush_px;
+    r300_gl_zflush(s);
+    r300_gl_zdiscard(s);
     r300_gl_flush(s);
     r300_gl_discard(s);
     s->gl_res = false;
@@ -5618,12 +5890,20 @@ void ati_r350_gl_reset(ATIR350State *s)
 void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
 {
     uint32_t lo, hi;
+    bool hit = false;
 
-    if (!ati_r350_gl_mine(s) ||
-        !r300_gl_span(s, &lo, &hi) || off + len <= lo || off >= hi) {
+    if (!ati_r350_gl_mine(s)) {
         return;
     }
-    ati_r350_gl_release(s, R350_GLR_READ);
+    if (r300_gl_span(s, &lo, &hi) && off + len > lo && off < hi) {
+        hit = true;
+    }
+    if (r300_gl_zspan(s, &lo, &hi) && off + len > lo && off < hi) {
+        hit = true;
+    }
+    if (hit) {
+        ati_r350_gl_release(s, R350_GLR_READ);
+    }
 }
 
 /* a WRITER of this range: whatever was decoded from it is now stale */
@@ -5669,6 +5949,7 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
     }
     if (x1 > s->gl_tex_w || y1 > s->gl_tex_h) {
         r300_gl_flush(s);               /* the grow below discards it */
+        r300_gl_zflush(s);
     }
     if (!ati_r350_gl_target(s->gl_ctx, x1, y1, &lost)) {
         ati_r350_gl_release(s, R350_GLR_BACKEND);
@@ -5678,6 +5959,7 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
         s->gl_tex_w = MAX(x1, s->gl_tex_w);
         s->gl_tex_h = MAX(y1, s->gl_tex_h);
         r300_gl_discard(s);
+        r300_gl_zdiscard(s);
     }
     for (i = 0; s->gl_texlife != R350_TEXLIFE_NEVER &&
                 i < R300_GL_TEXCACHE; i++) {
@@ -6591,7 +6873,8 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
  * and that shape reads coordinate set 0 and nothing else.
  */
 static void r300_gl_vtx(float *v, const R300Vtx *me, const R300Vtx *t0,
-                        const R300Vtx *t1, const R300Vtx *t2, float inv)
+                        const R300Vtx *t1, const R300Vtx *t2, float inv,
+                        bool back)
 {
     const unsigned C = R350_GL_TEXCOORDS;
     unsigned k;
@@ -6632,6 +6915,9 @@ static void r300_gl_vtx(float *v, const R300Vtx *me, const R300Vtx *t0,
     v[35 + 8 * C] = t2->b1; v[36 + 8 * C] = t2->a1;
     v[37 + 8 * C] = inv;
     v[38 + 8 * C] = t0->w; v[39 + 8 * C] = t1->w; v[40 + 8 * C] = t2->w;
+    /* the depth test's: screen-linear Z, and which face the stencil uses */
+    v[41 + 8 * C] = t0->z; v[42 + 8 * C] = t1->z; v[43 + 8 * C] = t2->z;
+    v[44 + 8 * C] = back ? 1.0f : 0.0f;
 }
 
 /*
@@ -6742,6 +7028,17 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     int x0, y0, x1, y1, w, h;
     size_t rect_sz, texels = 0;
     bool sc_empty = false;
+    /*
+     * The depth test on the host GPU, when the backend has a depth
+     * buffer; and whether this draw shades at all -- a depth-only pass
+     * (every colour channel masked) is offloaded only for such a
+     * backend, and then samples nothing and runs no program.
+     */
+    bool gpuz = s->zb.z_en && ati_r350_gl_depth(s->gl_ctx);
+    bool shade = d->wmask != 0;
+    /* r300_raster_prims()'s cull word: only these primitives are culled */
+    unsigned cullw = (prim >= 4 && prim <= 7) || (prim >= 13 && prim <= 15)
+                     ? s->regs[R300_RE_CULL_CNTL >> 2] & 7 : 8;
 
     for (i = 0; i < R300_TEX_UNITS; i++) {
         texslot[i] = R350_GL_TEXSLOTS;
@@ -6756,11 +7053,19 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
      * interpolated colour; sending this draw to a shader that computes
      * something else would be the one thing worse than either.
      */
-    if (!d->fs_run || !s->us_glsl_ok) {
+    if (shade && (!d->fs_run || !s->us_glsl_ok)) {
         return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
     }
-    /* the GL target has no depth or stencil buffer: the Z buffer is ours */
-    if (s->zb.z_en && (s->zb.s_en || s->zb.zfunc != 7)) {
+    if (!shade && !gpuz) {
+        return r300_gl_fallback(s, R350_GLF_ZTEST, prim, nvtx);
+    }
+    /*
+     * A backend without a depth buffer: the Z buffer is ours, and only a
+     * test that always passes may be offloaded (the depth write then
+     * goes through the software path afterwards). One with a depth
+     * buffer runs the whole test itself -- see "GL-OWNED DEPTH BUFFER".
+     */
+    if (s->zb.z_en && !gpuz && (s->zb.s_en || s->zb.zfunc != 7)) {
         return r300_gl_fallback(s, R350_GLF_ZTEST, prim, nvtx);
     }
     /*
@@ -6818,7 +7123,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
      * self-overlapping blended draw in one go, exactly. No partition, no
      * passes, and no add-blend approximation are needed for it.
      */
-    if (d->blend && d->blend_read && ntri > 1 &&
+    if (shade && d->blend && d->blend_read && ntri > 1 &&
         !ati_r350_gl_ordered(s->gl_ctx)) {
         npass = ntri > R300_GL_TRI_MAX
                 ? 0 : r300_gl_passes(s, gvb, idx, ntri);
@@ -6898,7 +7203,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     for (i = 0; i < R300_TEX_UNITS; i++) {
         size_t n;
 
-        if (!d->tex[i].en) {
+        if (!d->tex[i].en || !shade) {
             continue;
         }
         n = (size_t)d->tex[i].w * d->tex[i].h;
@@ -6932,16 +7237,20 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         const R300Vtx *t0 = &gvb[idx[src + 0]];
         const R300Vtx *t1 = &gvb[idx[src + 1]];
         const R300Vtx *t2 = &gvb[idx[src + 2]];
-        float inv = 1.0f / r300_edge(t0, t1, t2->x, t2->y);
+        float area = r300_edge(t0, t1, t2->x, t2->y);
+        float inv = 1.0f / area;
+        /* the facing r300_raster_tri() gives the stencil test */
+        unsigned cw = cullw | (prim == 6 && (idx[src + 2] & 1) ? 16 : 0);
+        bool back = r300_back_face(cw, area);
         unsigned k;
 
         for (k = 0; k < 3; k++) {
             r300_gl_vtx(s->gl_verts + (size_t)(i * 3 + k) * R350_GL_VSTRIDE,
-                        &gvb[idx[src + k]], t0, t1, t2, inv);
+                        &gvb[idx[src + k]], t0, t1, t2, inv, back);
         }
     }
     for (i = 0; i < R300_TEX_UNITS; i++) {
-        if (d->tex[i].en) {
+        if (d->tex[i].en && shade) {
             texbuf[i] = r300_gl_texture(s, d, i, &texslot[i], &texfresh[i]);
         }
     }
@@ -6953,6 +7262,9 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     if (!r300_gl_bind(s, d, xr, x0, y0, x1, y1)) {
         return r300_gl_fallback(s, R350_GLF_SURFACE, prim, nvtx);
     }
+    if (gpuz && !r300_gl_zbind(s, x0, y0, x1, y1)) {
+        return r300_gl_fallback(s, R350_GLF_BACKEND, prim, nvtx);
+    }
 
     req.x0 = x0; req.y0 = y0; req.w = w; req.h = h;
     req.surf_w = s->gl_tex_w;
@@ -6961,7 +7273,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.nvert = ntri * 3;
     req.pass = npass > 1 ? s->gl_pass_first : NULL;
     req.npass = npass;
-    for (i = 0; i < R300_TEX_UNITS; i++) {
+    for (i = 0; i < R300_TEX_UNITS && shade; i++) {
         req.tex[i] = d->tex[i].en ? texbuf[i] : NULL;
         req.tex_slot[i] = texslot[i];
         req.tex_fresh[i] = texfresh[i];
@@ -6992,6 +7304,31 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.us_glsl = s->us_glsl;
     req.us_key = s->us_glsl_key;
     req.us_konst = s->us_konst_flat;
+    if (!shade) {
+        /*
+         * A depth-only pass. r300_raster_tri() shades nothing for one and
+         * runs no alpha test, so neither does the backend: a fixed
+         * program, no texture, no test, and a write mask that keeps
+         * every colour byte as it was.
+         */
+        req.us_glsl = r300_gl_zonly_us;
+        req.us_key = R300_GL_ZONLY_KEY;
+        req.alpha_test = 0;
+        req.discard = 0;
+        req.blend = 0;
+        req.textured = 0;
+    }
+    if (gpuz) {
+        req.zmode = s->zb.z16 ? 2 : 1;
+        req.z_test = s->zb.z_test;
+        req.z_wr = s->zb.z_wr;
+        req.s_en = s->zb.s_en;
+        req.s_fb = s->zb.s_fb;
+        req.zsc = s->zb.zsc;
+        req.s_ref = s->zb.s_ref;
+        req.s_mask = s->zb.s_mask;
+        req.s_wmask = s->zb.s_wmask;
+    }
 
     if (s->gl_mode == R350_GL_VERIFY) {
         r300_gl_rd_rect(d, xr, x0, y0, w, h, s->gl_before);
@@ -7015,7 +7352,21 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         r300_raster_prims(s, d, vb, nvtx, prim);
         r300_gl_verify(s, d, prim, ntri, xr, x0, y0, w, h);
         r300_gl_discard(s);
+        /* the rasterizer wrote the Z buffer in VRAM too */
+        r300_gl_zdiscard(s);
         return R300_GL_DRAWN;
+    }
+    if (gpuz && (s->zb.z_wr || s->zb.s_en)) {
+        /* ... and the depth buffer, over the same rectangle */
+        if (s->gl_zdx1 <= s->gl_zdx0) {
+            s->gl_zdx0 = x0; s->gl_zdy0 = y0;
+            s->gl_zdx1 = x1; s->gl_zdy1 = y1;
+        } else {
+            s->gl_zdx0 = MIN(s->gl_zdx0, x0);
+            s->gl_zdy0 = MIN(s->gl_zdy0, y0);
+            s->gl_zdx1 = MAX(s->gl_zdx1, x1);
+            s->gl_zdy1 = MAX(s->gl_zdy1, y1);
+        }
     }
     /* the GPU now holds bytes VRAM does not, over this rectangle */
     if (s->gl_dx1 <= s->gl_dx0) {
@@ -7135,16 +7486,19 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
         r300_cap_draw(s, d, vb, nvtx, prim);
         return;
     }
-    if (s->gl_ctx && nvtx && d->wmask) {
+    if (s->gl_ctx && nvtx &&
+        (d->wmask || (s->zb.z_en && ati_r350_gl_depth(s->gl_ctx)))) {
         R300GlOutcome o = r300_gl_prims(s, d, vb, nvtx, prim);
 
         if (o == R300_GL_DRAWN) {
             /*
-             * The backend rendered the colour. The Z buffer is the
-             * CPU's to read, so the depth still goes through the
-             * software path, shading nothing.
+             * The backend rendered the colour. Without a depth buffer of
+             * its own the Z buffer is the CPU's to read, so the depth
+             * still goes through the software path, shading nothing;
+             * with one, the backend did the depth too.
              */
-            if (s->zb.z_en && s->zb.z_wr) {
+            if (s->zb.z_en && s->zb.z_wr &&
+                !ati_r350_gl_depth(s->gl_ctx)) {
                 d->wmask = 0;
                 r300_raster_prims(s, d, vb, nvtx, prim);
             }

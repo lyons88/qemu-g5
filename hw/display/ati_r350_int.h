@@ -173,6 +173,7 @@ typedef enum ATIR350GlRel {
     R350_GLR_BACKEND,       /* the backend declined, mid-draw */
     R350_GLR_RESET,         /* reset, unrealize */
     R350_GLR_FENCE,         /* a scratch or read pointer write, threaded CP */
+    R350_GLR_ZCLEAR,        /* 3D_CLEAR_ZMASK writes the depth buffer */
     R350_GLR_MAX
 } ATIR350GlRel;
 
@@ -698,6 +699,23 @@ struct ATIR350State {
     int gl_dx0, gl_dy0, gl_dx1, gl_dy1; /* drawn: the GPU copy is NEWER */
     uint64_t gl_flushes;                /* fetches back into VRAM */
     uint64_t gl_flush_px, gl_seed_px;   /* ... and pixels moved each way */
+    /*
+     * The resident DEPTH buffer, for a backend that has one
+     * (ati_r350_gl_depth(): Metal). Same rules as the colour target --
+     * see "GL-OWNED DEPTH BUFFER" in ati_r350_3d.c -- and it is only
+     * ever resident while the colour target is, so every hook that
+     * tests `gl_res` covers it too. The layout fields are the ZB_*
+     * decode it was seeded under; a draw naming another one flushes it.
+     */
+    bool gl_zres;
+    uint32_t gl_z_off, gl_z_pitch;
+    bool gl_z_macro, gl_z_aa, gl_z_z16;
+    unsigned gl_z_micro;
+    int gl_zvx0, gl_zvy0, gl_zvx1, gl_zvy1;     /* seeded */
+    int gl_zdx0, gl_zdy0, gl_zdx1, gl_zdy1;     /* written: GPU is NEWER */
+    uint32_t *gl_zstage;                /* one rectangle of Z words */
+    size_t gl_zstage_n;
+    uint64_t gl_zflushes, gl_zflush_px, gl_zseed_px;
     uint64_t gl_rel[R350_GLR_MAX];      /* which hook ended a residency */
     uint64_t gl_rel_px[R350_GLR_MAX];   /* ... and what it cost to */
     /* the same question one level finer for the 2D engine's three paths */

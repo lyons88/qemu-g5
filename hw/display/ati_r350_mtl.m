@@ -23,6 +23,18 @@
  *     channels keep the fetched value), so one pipeline serves every
  *     mask and the pipeline cache is keyed on the program alone.
  *
+ * THE DEPTH BUFFER is a second colour attachment, R32Uint, holding each
+ * pixel's Z word exactly as VRAM holds it -- (z24 << 8) | stencil, or
+ * the 16-bit Z -- and read by the same framebuffer fetch. The depth and
+ * stencil test is r300_zb_pixel() in the shader, in its place in the
+ * software path's order (after the alpha test, before DISCARD_SRC and
+ * the blend), with integer compares and the device's stencil ops; a
+ * fragment that fails still writes its stencil result and leaves the
+ * colour alone. Metal's own depth test is not used: it cannot do the
+ * device's 24-bit integer compare or its quantisation of Z. The caller
+ * untiles and seeds it, and flushes it back, under the colour target's
+ * rules (see "GL-OWNED DEPTH BUFFER" in ati_r350_3d.c).
+ *
  * THE ARITHMETIC is Cat_7's, statement for statement: the fragment
  * shader below is fs_src from ati_r350_gl.c rewritten in MSL, including
  * the explicit fma() calls, the host-computed 1/area, and the k/255
@@ -71,6 +83,8 @@
 #define ati_r350_gl_prog_stats  r350_mtl_prog_stats
 #define ati_r350_gl_barriers    r350_mtl_barriers
 #define ati_r350_gl_queue_stats r350_mtl_queue_stats
+#define ati_r350_gl_zseed       r350_mtl_zseed
+#define ati_r350_gl_zfetch      r350_mtl_zfetch
 #include "ati_r350_gpu.h"
 
 #import <Metal/Metal.h>
@@ -104,7 +118,11 @@ typedef struct MtlFlight {
 enum {
     IV_TEXW, IV_TEXH, IV_CLAMPS, IV_CLAMPT, IV_TEXTURED, IV_ATEST,
     IV_AFUNC, IV_DISCARD, IV_BLEND, IV_BREAD, IV_CSRC, IV_CDST, IV_CCOMB,
-    IV_ASRC, IV_ADST, IV_ACOMB, IV_WMASK, IV_N = 20
+    IV_ASRC, IV_ADST, IV_ACOMB, IV_WMASK,
+    /* the depth and stencil test, as R350GlReq carries it */
+    IV_ZMODE, IV_ZTEST, IV_ZWR, IV_SEN, IV_SFB, IV_ZSC, IV_SREF, IV_SMASK,
+    IV_SWMASK,
+    IV_N = 28
 };
 
 typedef struct MtlFsU {
@@ -125,6 +143,7 @@ struct R350MtlCtx {
 
     /* the resident target */
     id<MTLTexture> cbuf;
+    id<MTLTexture> zbuf;                /* one Z word per pixel, R32Uint */
     int fb_w, fb_h;
 
     /* uploaded textures by caller slot, plus the scratch at the end */
@@ -208,7 +227,7 @@ static const char *mtl_body =
 "    float pad1;\n"
 "    float pad2;\n"
 "    int tf[16];\n"
-"    int iv[20];\n"
+"    int iv[28];\n"
 "};\n"
 "#define IV_TEXW 0\n"
 "#define IV_TEXH 1\n"
@@ -227,6 +246,15 @@ static const char *mtl_body =
 "#define IV_ADST 14\n"
 "#define IV_ACOMB 15\n"
 "#define IV_WMASK 16\n"
+"#define IV_ZMODE 17\n"
+"#define IV_ZTEST 18\n"
+"#define IV_ZWR 19\n"
+"#define IV_SEN 20\n"
+"#define IV_SFB 21\n"
+"#define IV_ZSC 22\n"
+"#define IV_SREF 23\n"
+"#define IV_SMASK 24\n"
+"#define IV_SWMASK 25\n"
 "\n"
 "struct VOut {\n"
 "    float4 pos [[position]];\n"
@@ -243,6 +271,7 @@ static const char *mtl_body =
 "    float4 s0 [[flat]];\n"
 "    float4 s1 [[flat]];\n"
 "    float4 s2 [[flat]];\n"
+"    float4 zb [[flat]];\n"
 "};\n"
 "\n"
 "static float2 ld2(const device float *v, int o)\n"
@@ -268,6 +297,7 @@ static const char *mtl_body =
 "    o.t0 = ld2(v, OFF_T0); o.t1 = ld2(v, OFF_T1); o.t2 = ld2(v, OFF_T2);\n"
 "    o.inv = ld4(v, OFF_INV);\n"
 "    o.s0 = ld4(v, OFF_S0); o.s1 = ld4(v, OFF_S1); o.s2 = ld4(v, OFF_S2);\n"
+"    o.zb = ld4(v, OFF_Z);\n"
 "    return o;\n"
 "}\n"
 "\n"
@@ -464,12 +494,44 @@ static const char *mtl_body =
 "    dy = ry;\n"
 "}\n"
 "\n"
+/* r300_zs_cmp(): `a` is the incoming value, `b` the stored one */
+"static bool zs_cmp(uint fn, uint a, uint b)\n"
+"{\n"
+"    switch (fn) {\n"
+"    case 0: return false;\n"
+"    case 1: return a < b;\n"
+"    case 2: return a <= b;\n"
+"    case 3: return a == b;\n"
+"    case 4: return a >= b;\n"
+"    case 5: return a > b;\n"
+"    case 6: return a != b;\n"
+"    default: return true;\n"
+"    }\n"
+"}\n"
+"\n"
+/* r300_stencil_op() */
+"static uint zs_sop(uint op, uint v, uint ref)\n"
+"{\n"
+"    switch (op) {\n"
+"    case 1: return 0u;\n"
+"    case 2: return ref;\n"
+"    case 3: return min(v + 1u, 0xffu);\n"
+"    case 4: return v - (v != 0u ? 1u : 0u);\n"
+"    case 5: return ~v & 0xffu;\n"
+"    case 6: return (v + 1u) & 0xffu;\n"
+"    case 7: return (v - 1u) & 0xffu;\n"
+"    default: return v;\n"
+"    }\n"
+"}\n"
+"\n"
 "struct FOut {\n"
 "    uint4 c [[color(0)]];\n"
+"    uint z [[color(1)]];\n"
 "};\n"
 "\n"
 "fragment FOut r350_fs(VOut in [[stage_in]],\n"
 "                      uint4 dst [[color(0)]],\n"
+"                      uint zin [[color(1)]],\n"
 "                      constant FsU &u [[buffer(0)]],\n"
 "                      constant float4 *USK [[buffer(1)]],\n"
 "                      constant float *N255 [[buffer(2)]],\n"
@@ -488,6 +550,8 @@ static const char *mtl_body =
 "    float w0 = d0 * inv;\n"
 "    float w1 = d1 * inv;\n"
 "    float w2 = 1.0f - w0 - w1;\n"
+/* Z is screen-linear: these weights, before any perspective correction */
+"    float sw0 = w0, sw1 = w1, sw2 = w2;\n"
 "    float iq = 1.0f;\n"
 "    bool persp = in.inv.y != in.inv.z || in.inv.z != in.inv.w;\n"
 "    if (persp) {\n"
@@ -560,7 +624,50 @@ static const char *mtl_body =
 "        else             pass = true;\n"
 "        if (!pass) discard_fragment();\n"
 "    }\n"
-"    if (u.iv[IV_DISCARD] != 0) {\n"
+/*
+ * r300_zb_pixel(), after the alpha test and before DISCARD_SRC_PIXELS,
+ * as the software path orders them. A fragment the depth or stencil
+ * test fails is NOT discarded here: the stencil op on failure still
+ * writes, so it goes through with its colour left as it was.
+ */
+"    uint zout = zin;\n"
+"    bool live = true;\n"
+"    if (u.iv[IV_ZMODE] != 0) {\n"
+"        float zf = fma(sw2, in.zb.z, fma(sw1, in.zb.y, sw0 * in.zb.x));\n"
+"        float zt = zf > 0.0f ? zf : 0.0f;\n"
+"        zt = zt < 1.0f ? zt : 1.0f;\n"
+"        uint zfn = uint(u.iv[IV_ZSC]) & 7u;\n"
+"        bool ztest = u.iv[IV_ZTEST] != 0, zwr = u.iv[IV_ZWR] != 0;\n"
+"        if (u.iv[IV_ZMODE] == 2) {\n"
+"            uint zold = zin & 0xffffu;\n"
+"            uint znew = uint(zt * 65535.0f);\n"
+"            bool zpass = !ztest || zs_cmp(zfn, znew, zold);\n"
+"            if (zpass && zwr) zout = znew;\n"
+"            live = zpass;\n"
+"        } else {\n"
+"            uint zold = zin >> 8, sold = zin & 0xffu, snew = sold;\n"
+"            uint znew = uint(zt * 16777215.0f);\n"
+"            bool zpass = !ztest || zs_cmp(zfn, znew, zold);\n"
+"            bool spass = true;\n"
+"            if (u.iv[IV_SEN] != 0) {\n"
+"                uint zsc = uint(u.iv[IV_ZSC]);\n"
+"                uint sref = uint(u.iv[IV_SREF]), smask = uint(u.iv[IV_SMASK]);\n"
+"                uint swm = uint(u.iv[IV_SWMASK]);\n"
+"                uint f = in.zb.w != 0.0f && u.iv[IV_SFB] != 0\n"
+"                         ? (zsc >> 15) & 0xfffu : (zsc >> 3) & 0xfffu;\n"
+"                spass = zs_cmp(f & 7u, sref & smask, sold & smask);\n"
+"                uint op = !spass ? (f >> 3) & 7u\n"
+"                        : !zpass ? (f >> 9) & 7u : (f >> 6) & 7u;\n"
+"                snew = zs_sop(op, sold, sref);\n"
+"                snew = (sold & ~swm) | (snew & swm);\n"
+"            }\n"
+"            if (!(spass && zpass && zwr)) znew = zold;\n"
+"            zout = (znew << 8) | snew;\n"
+"            live = spass && zpass;\n"
+"        }\n"
+"    }\n"
+"    if (live && u.iv[IV_DISCARD] != 0) {\n"
+
 "        int k = u.iv[IV_DISCARD];\n"
 "        bool a0 = c.a == 0.0f, a1 = c.a == 1.0f;\n"
 "        bool z0 = c.r == 0.0f && c.g == 0.0f && c.b == 0.0f;\n"
@@ -572,13 +679,13 @@ static const char *mtl_body =
 "        else if (k == 4) kill = a1;\n"
 "        else if (k == 5) kill = z1;\n"
 "        else if (k == 6) kill = a1 && z1;\n"
-"        if (kill) discard_fragment();\n"
+"        if (kill) live = false;\n"
 "    }\n"
 /*
  * The blend, against the pixel as the previous primitive left it --
  * framebuffer fetch, in primitive order. Cat_7's expressions verbatim.
  */
-"    if (u.iv[IV_BLEND] != 0) {\n"
+"    if (live && u.iv[IV_BLEND] != 0) {\n"
 "        float4 d = u.iv[IV_BREAD] != 0\n"
 "                   ? float4(N255[dst.r], N255[dst.g], N255[dst.b],\n"
 "                            N255[dst.a])\n"
@@ -605,8 +712,10 @@ static const char *mtl_body =
 "    uint wm = uint(u.iv[IV_WMASK]);\n"
 "    bool4 wr = bool4((wm & 0x00ff0000u) != 0u, (wm & 0x0000ff00u) != 0u,\n"
 "                     (wm & 0x000000ffu) != 0u, (wm & 0xff000000u) != 0u);\n"
+"    if (!live) wr = bool4(false);\n"
 "    FOut f;\n"
 "    f.c = select(dst, o, wr);\n"
+"    f.z = zout;\n"
 "    return f;\n"
 "}\n";
 
@@ -704,13 +813,15 @@ static id<MTLRenderPipelineState> mtl_build(R350MtlCtx *g, const char *us,
         "#define OFF_C0 %d\n#define OFF_C1 %d\n#define OFF_C2 %d\n"
         "#define OFF_T0 %d\n#define OFF_T1 %d\n#define OFF_T2 %d\n"
         "#define OFF_INV %d\n"
-        "#define OFF_S0 %d\n#define OFF_S1 %d\n#define OFF_S2 %d\n",
+        "#define OFF_S0 %d\n#define OFF_S1 %d\n#define OFF_S2 %d\n"
+        "#define OFF_Z %d\n",
         R350_GL_VSTRIDE,
         6 + 2 * C, 8 + 2 * C, 10 + 2 * C,
         12 + 2 * C, 16 + 2 * C, 20 + 2 * C,
         24 + 2 * C, 24 + 4 * C, 24 + 6 * C,
         37 + 8 * C,
-        25 + 8 * C, 29 + 8 * C, 33 + 8 * C);
+        25 + 8 * C, 29 + 8 * C, 33 + 8 * C,
+        41 + 8 * C);
     g_string_append(s, "#define precise\n#define clamp r3_clamp\n");
     g_string_append_len(s, us, hook - us);
     g_string_append(s, mtl_us_to);
@@ -737,6 +848,8 @@ static id<MTLRenderPipelineState> mtl_build(R350MtlCtx *g, const char *us,
     pd.fragmentFunction = ff;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Uint;
     pd.colorAttachments[0].blendingEnabled = NO;
+    pd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
+    pd.colorAttachments[1].blendingEnabled = NO;
     e = nil;
     pso = (vf && ff) ? [g->dev newRenderPipelineStateWithDescriptor:pd
                                                               error:&e]
@@ -864,6 +977,9 @@ static id<MTLRenderCommandEncoder> mtl_enc(R350MtlCtx *g)
         rp.colorAttachments[0].texture = g->cbuf;
         rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[1].texture = g->zbuf;
+        rp.colorAttachments[1].loadAction = MTLLoadActionLoad;
+        rp.colorAttachments[1].storeAction = MTLStoreActionStore;
         g->enc = [[mtl_cb(g) renderCommandEncoderWithDescriptor:rp] retain];
         [g->enc setFragmentBuffer:g->n255 offset:0 atIndex:2];
         g->enc_pso = nil;
@@ -918,7 +1034,8 @@ static id<MTLBuffer> mtl_alloc(R350MtlCtx *g, size_t len, size_t *off)
  * Copy [x0,x0+w) x [y0,y0+h) of the target out, packed RGBA rows, and
  * wait for it. Returns the bytes, valid until the next call, or NULL.
  */
-static const uint8_t *mtl_read(R350MtlCtx *g, int x0, int y0, int w, int h)
+static const uint8_t *mtl_read(R350MtlCtx *g, id<MTLTexture> t,
+                               int x0, int y0, int w, int h)
 {
     size_t need = (size_t)w * h * 4;
     id<MTLBlitCommandEncoder> b;
@@ -934,7 +1051,7 @@ static const uint8_t *mtl_read(R350MtlCtx *g, int x0, int y0, int w, int h)
     }
     mtl_end_enc(g);
     b = [mtl_cb(g) blitCommandEncoder];
-    [b copyFromTexture:g->cbuf
+    [b copyFromTexture:t
            sourceSlice:0
            sourceLevel:0
           sourceOrigin:MTLOriginMake(x0, y0, 0)
@@ -1045,6 +1162,7 @@ void ati_r350_gl_close(R350MtlCtx *g)
         [g->rb release];
         [g->arena_free release];
         [g->cbuf release];
+        [g->zbuf release];
         [g->white release];
         [g->n255 release];
         [g->q release];
@@ -1084,7 +1202,7 @@ void ati_r350_gl_queue_stats(R350MtlCtx *g, uint64_t *units,
 bool ati_r350_gl_target(R350MtlCtx *g, int w, int h, bool *lost)
 {
     MTLTextureDescriptor *d;
-    id<MTLTexture> t;
+    id<MTLTexture> t, z;
 
     *lost = false;
     if (!g || w <= 0 || h <= 0) {
@@ -1109,12 +1227,19 @@ bool ati_r350_gl_target(R350MtlCtx *g, int w, int h, bool *lost)
         d.storageMode = MTLStorageModePrivate;
         d.usage = MTLTextureUsageRenderTarget;
         t = [g->dev newTextureWithDescriptor:d];
-        if (!t) {
+        d.pixelFormat = MTLPixelFormatR32Uint;
+        z = [g->dev newTextureWithDescriptor:d];
+        if (!t || !z) {
+            [t release];
+            [z release];
             return false;
         }
         mtl_hold(g, g->cbuf);
+        mtl_hold(g, g->zbuf);
         [g->cbuf release];
+        [g->zbuf release];
         g->cbuf = t;
+        g->zbuf = z;
         g->fb_w = w;
         g->fb_h = h;
     }
@@ -1185,7 +1310,7 @@ bool ati_r350_gl_fetch(R350MtlCtx *g, int x0, int y0, int w, int h,
         return false;
     }
     @autoreleasepool {
-        st = mtl_read(g, x0, y0, w, h);
+        st = mtl_read(g, g->cbuf, x0, y0, w, h);
     }
     if (!st) {
         return false;
@@ -1201,6 +1326,63 @@ bool ati_r350_gl_fetch(R350MtlCtx *g, int x0, int y0, int w, int h,
             p[3 ^ xr] = i[3];
         }
     }
+    return true;
+}
+
+/*
+ * The depth buffer, both ways: packed rows of Z words, no swapper and no
+ * tiling -- the caller has already undone both. Blits in the command
+ * stream, like the colour target's.
+ */
+bool ati_r350_gl_zseed(R350MtlCtx *g, int x0, int y0, int w, int h,
+                       const uint32_t *z)
+{
+    size_t need = (size_t)w * h * 4, off = 0;
+    id<MTLBlitCommandEncoder> b;
+    id<MTLBuffer> sb;
+
+    if (!g || !g->zbuf || w <= 0 || h <= 0 ||
+        x0 < 0 || y0 < 0 || x0 + w > g->fb_w || y0 + h > g->fb_h) {
+        return false;
+    }
+    @autoreleasepool {
+        sb = mtl_alloc(g, need, &off);
+        if (!sb) {
+            return false;
+        }
+        memcpy((uint8_t *)sb.contents + off, z, need);
+        mtl_end_enc(g);
+        b = [mtl_cb(g) blitCommandEncoder];
+        [b copyFromBuffer:sb
+             sourceOffset:off
+        sourceBytesPerRow:(NSUInteger)w * 4
+      sourceBytesPerImage:need
+               sourceSize:MTLSizeMake(w, h, 1)
+                toTexture:g->zbuf
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(x0, y0, 0)];
+        [b endEncoding];
+    }
+    return !g->failed;
+}
+
+bool ati_r350_gl_zfetch(R350MtlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t *z)
+{
+    const uint8_t *st;
+
+    if (!g || !g->zbuf || w <= 0 || h <= 0 ||
+        x0 < 0 || y0 < 0 || x0 + w > g->fb_w || y0 + h > g->fb_h) {
+        return false;
+    }
+    @autoreleasepool {
+        st = mtl_read(g, g->zbuf, x0, y0, w, h);
+    }
+    if (!st) {
+        return false;
+    }
+    memcpy(z, st, (size_t)w * h * 4);
     return true;
 }
 
@@ -1374,6 +1556,15 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
             fu.iv[IV_ADST] = r->a_dst_factor;
             fu.iv[IV_ACOMB] = r->a_comb_fcn;
             fu.iv[IV_WMASK] = (int32_t)r->wmask;
+            fu.iv[IV_ZMODE] = r->zmode;
+            fu.iv[IV_ZTEST] = r->z_test;
+            fu.iv[IV_ZWR] = r->z_wr;
+            fu.iv[IV_SEN] = r->s_en;
+            fu.iv[IV_SFB] = r->s_fb;
+            fu.iv[IV_ZSC] = (int32_t)r->zsc;
+            fu.iv[IV_SREF] = r->s_ref;
+            fu.iv[IV_SMASK] = r->s_mask;
+            fu.iv[IV_SWMASK] = r->s_wmask;
             rect[0] = 0.0f;
             rect[1] = 0.0f;
             rect[2] = (float)r->surf_w;
@@ -1437,7 +1628,8 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
 
         if (r->out) {
             /* gl=verify only; the resident target keeps the pixels */
-            const uint8_t *px = mtl_read(g, r->x0, r->y0, r->w, r->h);
+            const uint8_t *px = mtl_read(g, g->cbuf, r->x0, r->y0, r->w,
+                                         r->h);
 
             if (!px) {
                 return false;

@@ -75,13 +75,19 @@
  *   (25+8C)..(36+8C)  triangle vertex 0/1/2 SECOND colours
  *   (37+8C)           1.0f / signed area again
  *   (38+8C)..(40+8C)  triangle vertex 0/1/2 1/w
+ *   (41+8C)..(43+8C)  triangle vertex 0/1/2 Z (screen-linear)
+ *   (44+8C)           1.0f if the triangle is back-facing, else 0.0f
+ *
+ * The last four are the depth test's and only a backend with a depth
+ * buffer reads them; the GL backend's attribute table stops before them
+ * and only the stride grew.
  *
  * The second colour is the one a fragment program can add to the
  * modulated texel -- Chess.app's specular term -- and it is carried at
  * the corners like the first so the fragment stage interpolates it with
  * the same weights.
  */
-#define R350_GL_VSTRIDE (41 + 8 * R350_GL_TEXCOORDS)
+#define R350_GL_VSTRIDE (45 + 8 * R350_GL_TEXCOORDS)
 
 /*
  * How many uploaded textures the backend keeps, plus one: slot
@@ -233,6 +239,19 @@ typedef struct R350GlReq {
     const char *us_glsl;
     uint64_t us_key;
     const float *us_konst;      /* 32 * 4 floats */
+
+    /*
+     * The depth and stencil test, for a backend with a resident depth
+     * buffer (ati_r350_gl_depth()); zero `zmode` for any other, and the
+     * caller never sends a depth-tested draw to one. r300_zb_pixel() is
+     * the definition: `zmode` 1 is 24-bit Z above 8 stencil bits, 2 is
+     * 16-bit Z with no stencil; the rest is the ZB_* decode in s->zb.
+     * The per-vertex Z and the triangle's facing are in the vertices.
+     */
+    int zmode;
+    int z_test, z_wr, s_en, s_fb;
+    uint32_t zsc;               /* ZB_ZSTENCILCNTL */
+    int s_ref, s_mask, s_wmask;
 } R350GlReq;
 
 typedef struct R350GlCtx R350GlCtx;
@@ -264,6 +283,20 @@ R350GlCtx *ati_r350_gl_open_api(const char *api, const char **err);
  * go and still blends the way the device does.
  */
 bool ati_r350_gl_ordered(R350GlCtx *g);
+
+/*
+ * A resident depth/stencil buffer beside the colour target, the same
+ * size, holding one Z word per pixel exactly as r300_zb_pixel() reads
+ * it from VRAM: (z24 << 8) | stencil, or the 16-bit Z. The caller does
+ * the tiling and the swapper; the backend sees packed rows of words.
+ * Only the Metal backend has one; for any other depth() is false and
+ * zseed()/zfetch() refuse.
+ */
+bool ati_r350_gl_depth(R350GlCtx *g);
+bool ati_r350_gl_zseed(R350GlCtx *g, int x0, int y0, int w, int h,
+                       const uint32_t *z);
+bool ati_r350_gl_zfetch(R350GlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t *z);
 
 /*
  * Size the resident render target to at least w x h. Returns false if

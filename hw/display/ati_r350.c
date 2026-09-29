@@ -4587,6 +4587,7 @@ static void ati_r350_exit(PCIDevice *dev)
     g_free(s->gl_sw);
     g_free(s->gl_texbuf);
     g_free(s->gl_verts);
+    g_free(s->gl_zstage);
     if (s->agp_as_valid) {
         address_space_destroy(&s->agp_as);
         s->agp_as_valid = false;
@@ -5011,6 +5012,10 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
             g_string_append_printf(out, "\nmetal: %" PRIu64 " draws in %"
                                    PRIu64 " command buffers, %" PRIu64
                                    " render passes", qu, qf, qw);
+            g_string_append_printf(out, "\ndepth buffer: %" PRIu64
+                                   " flushes, %" PRIu64 " px out, %" PRIu64
+                                   " px in", s->gl_zflushes, s->gl_zflush_px,
+                                   s->gl_zseed_px);
         }
     }
     if (s->gl_addblend) {
