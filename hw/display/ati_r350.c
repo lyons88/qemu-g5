@@ -4406,6 +4406,18 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
         trace_ati_r350_gl_open(ati_r350_gl_describe(s->gl_ctx));
     }
     s->gl_pgbits = qemu_target_page_bits();
+    s->gl_lazy = s->gl_ctx && ati_r350_gl_depth(s->gl_ctx);
+    if (s->gl_sync && s->gl_sync[0]) {
+        if (!strcmp(s->gl_sync, "lazy")) {
+            s->gl_lazy = true;
+        } else if (!strcmp(s->gl_sync, "strict")) {
+            s->gl_lazy = false;
+        } else {
+            error_setg(errp, "gl-sync must be strict or lazy (got \"%s\")",
+                       s->gl_sync);
+            return;
+        }
+    }
     s->gl_texlife = R350_TEXLIFE_DIRTY;
     if (s->gl_texlife_path && s->gl_texlife_path[0]) {
         if (!strcmp(s->gl_texlife_path, "burst")) {
@@ -4644,6 +4656,7 @@ static const Property ati_r350_properties[] = {
      */
     DEFINE_PROP_STRING("gl", ATIR350State, gl_path),
     DEFINE_PROP_STRING("gl-api", ATIR350State, gl_api),
+    DEFINE_PROP_STRING("gl-sync", ATIR350State, gl_sync),
     /*
      * Diagnostic only (milestone M4): translate each vertex program the
      * guest uploads to GLSL and count whether the translator could
@@ -5014,8 +5027,14 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                                    " render passes", qu, qf, qw);
             g_string_append_printf(out, "\ndepth buffer: %" PRIu64
                                    " flushes, %" PRIu64 " px out, %" PRIu64
-                                   " px in", s->gl_zflushes, s->gl_zflush_px,
-                                   s->gl_zseed_px);
+                                   " px in, %" PRIu64 " clears on the GPU",
+                                   s->gl_zflushes, s->gl_zflush_px,
+                                   s->gl_zseed_px, s->gl_zclear_gpu);
+            g_string_append_printf(out, "\nsync %s: %" PRIu64
+                                   " burst ends kept resident, %" PRIu64
+                                   " refreshes flushed and kept",
+                                   s->gl_lazy ? "lazy" : "strict",
+                                   s->gl_lazy_skip, s->gl_lazy_keep);
         }
     }
     if (s->gl_addblend) {

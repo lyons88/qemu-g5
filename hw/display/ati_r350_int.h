@@ -640,6 +640,17 @@ struct ATIR350State {
      */
     char *gl_path;
     char *gl_api;               /* "gl-api": opengl (default) or metal */
+    /*
+     * "gl-sync": `strict` is Cat_7's rule, every burst ends the
+     * residency; `lazy` keeps the target on the GPU across bursts and
+     * hands it back only when something is known to look. See "LAZY
+     * RESIDENCY" in ati_r350_3d.c. Default: lazy on Metal, strict else.
+     */
+    char *gl_sync;
+    bool gl_lazy;
+    uint64_t gl_lazy_skip;      /* burst ends that did not release */
+    uint64_t gl_lazy_keep;      /* refreshes that flushed and stayed */
+    uint64_t gl_zclear_gpu;     /* Z clears done on the GPU copy too */
     ATIR350GlMode gl_mode;
     struct R350GlCtx *gl_ctx;
     uint64_t gl_drawn;          /* draws the backend rendered */

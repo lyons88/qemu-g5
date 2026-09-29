@@ -1189,6 +1189,8 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
  * ZB_ZMASK_PITCH pixels: a 640x480 clear is 600 dwords.
  */
 static void r300_gl_zrelease(ATIR350State *s, ATIR350GlRel why);
+static bool r300_gl_zclear_gpu(ATIR350State *s, uint32_t first, uint32_t n,
+                               unsigned bw, uint32_t val);
 
 void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
                                uint32_t val)
@@ -1208,8 +1210,6 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
                              &off)) {
         return;
     }
-    /* this writes the depth buffer in VRAM: a resident copy goes back */
-    r300_gl_zrelease(s, R350_GLR_ZCLEAR);
     s->zb.off = off;
     s->zb.pitch = ((zp >> 2) & 0xfff) * 4;
     s->zb.macro = zp & R300_ZB_MACROTILE;
@@ -1217,6 +1217,14 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
     s->zb.aa = smp == 2;
     s->zb.z16 = zfmt == R300_ZB_FORMAT_16;
     n = MIN(n, 0x100000);
+    /*
+     * This writes the depth buffer in VRAM. A resident copy of THIS
+     * buffer is cleared on the GPU as well, first, and stays resident;
+     * any other resident one, or a GPU clear that fails, goes back.
+     */
+    if (!r300_gl_zclear_gpu(s, first, n, bw, s->zb.z16 ? clr & 0xffff : clr)) {
+        r300_gl_zrelease(s, R350_GLR_ZCLEAR);
+    }
     for (i = first; i < first + n; i++) {
         unsigned bx = (i % bw) * 32, by = (i / bw) * 16;
 
@@ -5572,6 +5580,55 @@ static void r300_gl_zrelease(ATIR350State *s, ATIR350GlRel why)
     s->gl_rel_px[why] += s->gl_zflush_px - px;
 }
 
+/*
+ * 3D_CLEAR_ZMASK on the resident copy: the same 32x16 tiles, row-major
+ * over `bw` tiles a row, filled with `val` -- full rows merged into one
+ * rectangle. False when the resident depth buffer is not the one being
+ * cleared (or there is none), or a fill failed: the caller then gives
+ * it back before VRAM is written.
+ */
+static bool r300_gl_zclear_gpu(ATIR350State *s, uint32_t first, uint32_t n,
+                               unsigned bw, uint32_t val)
+{
+    uint32_t i = first, end = first + n;
+
+    if (!s->gl_zres || !ati_r350_gl_mine(s) ||
+        s->gl_z_off != s->zb.off || s->gl_z_pitch != s->zb.pitch ||
+        s->gl_z_macro != s->zb.macro || s->gl_z_micro != s->zb.micro ||
+        s->gl_z_aa != s->zb.aa || s->gl_z_z16 != s->zb.z16) {
+        return false;
+    }
+    while (i < end) {
+        unsigned row = i / bw, col = i % bw, rows = 1, cnt;
+        int x0, y0, x1, y1;
+
+        if (col == 0 && end - i >= bw) {
+            rows = (end - i) / bw;
+            cnt = bw;
+        } else {
+            cnt = MIN(end - i, bw - col);
+        }
+        x0 = col * 32;
+        y0 = row * 16;
+        x1 = MIN((int)((col + cnt) * 32), s->gl_tex_w);
+        y1 = MIN((int)((row + rows) * 16), s->gl_tex_h);
+        if (x1 > x0 && y1 > y0) {
+            size_t k, np = (size_t)(x1 - x0) * (y1 - y0);
+            uint32_t *st = r300_gl_zstage(s, np);
+
+            for (k = 0; k < np; k++) {
+                st[k] = val;
+            }
+            if (!ati_r350_gl_zseed(s->gl_ctx, x0, y0, x1 - x0, y1 - y0, st)) {
+                return false;
+            }
+        }
+        i += rows * cnt;
+    }
+    s->gl_zclear_gpu++;
+    return true;
+}
+
 /* seed [x0,x1) x [y0,y1) of the depth buffer from VRAM */
 static bool r300_gl_zseed_rect(ATIR350State *s, int x0, int y0,
                                int x1, int y1)
@@ -5841,12 +5898,73 @@ void ati_r350_gl_epoch(ATIR350State *s, DirtyBitmapSnapshot *snap)
     s->gl_tex_any = any;
 }
 
+/*
+ * LAZY RESIDENCY (gl-sync=lazy, the Metal default).
+ *
+ * Strict residency ends at every burst, because the guest CPU could read
+ * VRAM the moment the CP stops. It is exactly right and it is what made
+ * the offload slow: OpenMark's driver fences every few draws, and each
+ * fence flushed the drawn rectangle -- a full GPU drain -- and threw the
+ * seeded one away, to be uploaded again by the very next draw. Measured
+ * on this host: 33,354 fence releases moving 7.0 G pixels each way.
+ *
+ * Lazy residency keeps the target (and the depth buffer) on the GPU
+ * across bursts, and gives it back only when something KNOWN looks:
+ *
+ *   burst ends         ring, IB, FIFO push, fence: nothing happens
+ *   display refresh    the drawn rectangle is flushed, so the frame is
+ *                      shown -- and the target STAYS resident, because
+ *                      after a flush the GPU copy and VRAM agree; unless
+ *                      the dirty bitmap shows a page of the seeded span
+ *                      was written since the last refresh (the guest CPU
+ *                      drew there), in which case it is released fully
+ *                      and re-seeded from VRAM on the next draw
+ *   everything else    exactly as strict: the 2D engine, MM_DATA, CP
+ *                      reads and write-backs, texture reads of the
+ *                      range, fallbacks, reset
+ *
+ * What it gives up: a guest CPU load of a pixel the GPU drew, between
+ * the draw and the next refresh, sees the old value. OS X reads its GL
+ * results back through the engine, not the aperture, so that window is
+ * almost never looked into; gl-sync=strict restores the exact rule.
+ */
+static bool r300_gl_seeded_dirty(ATIR350State *s)
+{
+    uint32_t lo, hi;
+
+    if (!r300_gl_span(s, &lo, &hi)) {
+        return false;
+    }
+    return r300_gl_range_dirty(s, lo, r300_gl_pages(s, lo, hi - lo));
+}
+
 void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
 {
     uint64_t px;
 
     if (!ati_r350_gl_mine(s)) {
         return;         /* the command processor's until it finishes */
+    }
+    if (s->gl_lazy && s->gl_res) {
+        switch (why) {
+        case R350_GLR_FENCE:
+        case R350_GLR_RING:
+        case R350_GLR_IB:
+        case R350_GLR_FIFO:
+            s->gl_lazy_skip++;
+            return;
+        case R350_GLR_SCANOUT:
+            if (!r300_gl_seeded_dirty(s)) {
+                px = s->gl_flush_px;
+                r300_gl_flush(s);
+                s->gl_lazy_keep++;
+                s->gl_rel_px[why] += s->gl_flush_px - px;
+                return;
+            }
+            break;
+        default:
+            break;
+        }
     }
     if (s->gl_texlife == R350_TEXLIFE_BURST) {
         r300_gl_texdrop(s);
