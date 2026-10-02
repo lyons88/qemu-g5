@@ -721,12 +721,16 @@ struct ATIR350State {
     /*
      * ZERO-COPY (ati_r350_gl_direct()). The GPU renders into VRAM itself;
      * `gl_res` then means "draws are submitted that may not have landed",
-     * and [gl_dlo, gl_dhi) is every VRAM byte they can write. A reader
-     * or writer of a range that meets it waits for the GPU first; nothing
-     * is ever copied.
+     * and the ranges in gl_drng[] are every VRAM byte they can write -- a
+     * few separate ranges, not one, because the colour buffer and the
+     * depth buffer can be far apart and one range spanning both covered
+     * every texture and vertex array in between, so nearly every draw
+     * waited for the GPU. A reader or writer of a range that meets one
+     * waits for the GPU first; nothing is ever copied.
      */
     bool gl_direct;
-    uint64_t gl_dlo, gl_dhi;
+    uint64_t gl_drng[8][2];
+    unsigned gl_dn;
     uint64_t gl_dsyncs;
     bool gl_zres;
     uint32_t gl_z_off, gl_z_pitch;

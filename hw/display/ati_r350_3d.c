@@ -5639,11 +5639,18 @@ static bool r300_gl_span(ATIR350State *s, uint32_t *lo, uint32_t *hi)
 {
     if (s->gl_direct) {
         /* zero-copy: every byte a submitted draw may still be writing */
-        if (!s->gl_res || s->gl_dhi <= s->gl_dlo) {
+        uint64_t l = UINT64_MAX, h = 0;
+        unsigned k;
+
+        if (!s->gl_res || !s->gl_dn) {
             return false;
         }
-        *lo = (uint32_t)s->gl_dlo;
-        *hi = (uint32_t)s->gl_dhi;
+        for (k = 0; k < s->gl_dn; k++) {
+            l = MIN(l, s->gl_drng[k][0]);
+            h = MAX(h, s->gl_drng[k][1]);
+        }
+        *lo = (uint32_t)l;
+        *hi = (uint32_t)h;
         return true;
     }
     if (!s->gl_res || s->gl_vy1 <= s->gl_vy0) {
@@ -6229,7 +6236,7 @@ void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
             ati_r350_gl_wait(s->gl_ctx);
             s->gl_dsyncs++;
             s->gl_res = false;
-            s->gl_dlo = s->gl_dhi = 0;
+            s->gl_dn = 0;
             s->gl_rel[why]++;
         }
         return;
@@ -6302,7 +6309,14 @@ void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
     if (!ati_r350_gl_mine(s)) {
         return;
     }
-    if (r300_gl_span(s, &lo, &hi) && off + len > lo && off < hi) {
+    if (s->gl_direct) {
+        unsigned k;
+
+        for (k = 0; s->gl_res && k < s->gl_dn && !hit; k++) {
+            hit = off + (uint64_t)len > s->gl_drng[k][0] &&
+                  off < s->gl_drng[k][1];
+        }
+    } else if (r300_gl_span(s, &lo, &hi) && off + len > lo && off < hi) {
         hit = true;
     }
     if (r300_gl_zspan(s, &lo, &hi) && off + len > lo && off < hi) {
@@ -6353,14 +6367,41 @@ static void r300_gl_dbind_range(ATIR350State *s, uint64_t lo, uint64_t hi)
             s->gl_tex[i].up = false;
         }
     }
-    if (!s->gl_res || s->gl_dhi <= s->gl_dlo) {
-        s->gl_dlo = lo;
-        s->gl_dhi = hi;
-    } else {
-        s->gl_dlo = MIN(s->gl_dlo, lo);
-        s->gl_dhi = MAX(s->gl_dhi, hi);
+    if (!s->gl_res) {
+        s->gl_dn = 0;
     }
     s->gl_res = true;
+    {
+        unsigned k, best = 0;
+        uint64_t gap = UINT64_MAX;
+
+        /* the same buffer again, or one touching it: grow that range */
+        for (k = 0; k < s->gl_dn; k++) {
+            if (lo <= s->gl_drng[k][1] && s->gl_drng[k][0] <= hi) {
+                s->gl_drng[k][0] = MIN(s->gl_drng[k][0], lo);
+                s->gl_drng[k][1] = MAX(s->gl_drng[k][1], hi);
+                return;
+            }
+        }
+        if (s->gl_dn < ARRAY_SIZE(s->gl_drng)) {
+            s->gl_drng[s->gl_dn][0] = lo;
+            s->gl_drng[s->gl_dn][1] = hi;
+            s->gl_dn++;
+            return;
+        }
+        /* full: fold it into the nearest, which only ever grows a range */
+        for (k = 0; k < s->gl_dn; k++) {
+            uint64_t g = lo > s->gl_drng[k][1] ? lo - s->gl_drng[k][1]
+                                               : s->gl_drng[k][0] - hi;
+
+            if (g < gap) {
+                gap = g;
+                best = k;
+            }
+        }
+        s->gl_drng[best][0] = MIN(s->gl_drng[best][0], lo);
+        s->gl_drng[best][1] = MAX(s->gl_drng[best][1], hi);
+    }
 }
 
 static bool r300_gl_dbind(ATIR350State *s, const R300DrawState *d, bool z,
