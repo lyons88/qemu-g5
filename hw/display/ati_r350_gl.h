@@ -252,6 +252,20 @@ typedef struct R350GlReq {
     int z_test, z_wr, s_en, s_fb;
     uint32_t zsc;               /* ZB_ZSTENCILCNTL */
     int s_ref, s_mask, s_wmask;
+
+    /*
+     * ZERO-COPY (ati_r350_gl_direct()): the backend renders straight into
+     * emulated VRAM, so it is told where the buffers ARE rather than
+     * being handed copies of them. The colour buffer is 32bpp at byte
+     * `cb_off`, `cb_pitch` bytes a row, through the swapper lane xor
+     * `cb_xr`; the depth buffer is r300_zaddr()'s layout at `z_off`
+     * under `z_xr`. Coordinates are still the device's own.
+     */
+    uint32_t cb_off, cb_pitch;
+    unsigned cb_xr;
+    uint32_t z_off, z_pitch;
+    int z_macro, z_micro, z_aa;
+    unsigned z_xr;
 } R350GlReq;
 
 typedef struct R350GlCtx R350GlCtx;
@@ -277,7 +291,7 @@ R350GlCtx *ati_r350_gl_open_api(const char *api, const char **err);
 /*
  * True when the backend blends every primitive against what the one
  * before it left at that pixel, in submission order, within ONE draw.
- * Metal's framebuffer fetch on an Apple GPU is exactly that. The caller
+ * Metal's raster order groups on an Apple GPU are exactly that. The caller
  * then partitions no self-overlapping blended draw into passes and never
  * needs gl=fast's add-blend approximation: the draw is rendered in one
  * go and still blends the way the device does.
@@ -293,6 +307,18 @@ bool ati_r350_gl_ordered(R350GlCtx *g);
  * zseed()/zfetch() refuse.
  */
 bool ati_r350_gl_depth(R350GlCtx *g);
+
+/*
+ * ZERO-COPY. A direct backend renders into emulated VRAM itself: give it
+ * the RAM with ati_r350_gl_vram() once, after open, and there is no
+ * resident target to seed or fetch -- ati_r350_gl_wait() waits until
+ * every draw submitted so far has landed in VRAM, which is all a reader
+ * of VRAM then needs. Only the Metal backend is direct (Apple GPUs share
+ * memory with the CPU).
+ */
+bool ati_r350_gl_direct(R350GlCtx *g);
+bool ati_r350_gl_vram(R350GlCtx *g, void *ptr, uint64_t size);
+bool ati_r350_gl_wait(R350GlCtx *g);
 bool ati_r350_gl_zseed(R350GlCtx *g, int x0, int y0, int w, int h,
                        const uint32_t *z);
 bool ati_r350_gl_zfetch(R350GlCtx *g, int x0, int y0, int w, int h,

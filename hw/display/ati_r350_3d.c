@@ -1328,6 +1328,9 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
         unsigned zxr = 0;
         bool fast = off + len <= ATI_R350_VRAM_SIZE &&
                     ati_r350_vram_xor_span(s, off, (uint32_t)len, &zxr);
+
+        /* zero-copy: depth writes the GPU still owes land first */
+        ati_r350_gl_touch(s, off, (uint32_t)MIN(len, (uint64_t)UINT32_MAX));
         uint8_t lane[4];
         uint32_t word;
 
@@ -5634,6 +5637,15 @@ uint32_t ati_r350_cap_vtx_bytes(void)
 /* the VRAM bytes the seeded rectangle covers; empty when nothing is */
 static bool r300_gl_span(ATIR350State *s, uint32_t *lo, uint32_t *hi)
 {
+    if (s->gl_direct) {
+        /* zero-copy: every byte a submitted draw may still be writing */
+        if (!s->gl_res || s->gl_dhi <= s->gl_dlo) {
+            return false;
+        }
+        *lo = (uint32_t)s->gl_dlo;
+        *hi = (uint32_t)s->gl_dhi;
+        return true;
+    }
     if (!s->gl_res || s->gl_vy1 <= s->gl_vy0) {
         return false;
     }
@@ -6208,6 +6220,20 @@ void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
     if (!ati_r350_gl_mine(s)) {
         return;         /* the command processor's until it finishes */
     }
+    if (s->gl_direct) {
+        /*
+         * Zero-copy: the draws already wrote VRAM, or will. Giving the
+         * target back is waiting for them to finish -- no pixel moves.
+         */
+        if (s->gl_res) {
+            ati_r350_gl_wait(s->gl_ctx);
+            s->gl_dsyncs++;
+            s->gl_res = false;
+            s->gl_dlo = s->gl_dhi = 0;
+            s->gl_rel[why]++;
+        }
+        return;
+    }
     if (s->gl_lazy && s->gl_res) {
         switch (why) {
         case R350_GLR_FENCE:
@@ -6304,6 +6330,55 @@ void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len)
     }
     qemu_rec_mutex_unlock(&s->gl_tex_lock);
     ati_r350_gl_sync(s, off, len);
+}
+
+/*
+ * ZERO-COPY's bind. Nothing is seeded: the GPU reads and writes the
+ * colour and depth buffers where they are. What is recorded is the VRAM
+ * this draw can write -- rows [y0, y1) of the colour buffer and every
+ * byte the depth layout can place above row y1 -- so a reader or writer
+ * of those bytes waits for the GPU first; and decoded textures taken
+ * from them are dropped, since GPU stores set no dirty bit.
+ */
+static void r300_gl_dbind_range(ATIR350State *s, uint64_t lo, uint64_t hi)
+{
+    unsigned i;
+
+    for (i = 0; s->gl_texlife != R350_TEXLIFE_NEVER &&
+                i < R300_GL_TEXCACHE; i++) {
+        if (s->gl_tex[i].live && lo < s->gl_tex[i].off + s->gl_tex[i].len &&
+            hi > s->gl_tex[i].off) {
+            s->gl_tex_over++;
+            s->gl_tex[i].live = false;
+            s->gl_tex[i].up = false;
+        }
+    }
+    if (!s->gl_res || s->gl_dhi <= s->gl_dlo) {
+        s->gl_dlo = lo;
+        s->gl_dhi = hi;
+    } else {
+        s->gl_dlo = MIN(s->gl_dlo, lo);
+        s->gl_dhi = MAX(s->gl_dhi, hi);
+    }
+    s->gl_res = true;
+}
+
+static bool r300_gl_dbind(ATIR350State *s, const R300DrawState *d, bool z,
+                          int y0, int x1, int y1)
+{
+    if (x1 > R300_GL_SURF_MAX || y1 > R300_GL_SURF_MAX) {
+        return false;
+    }
+    if (d->wmask) {
+        r300_gl_dbind_range(s, d->dst_off + (uint64_t)y0 * d->dst_pitch,
+                            d->dst_off + (uint64_t)y1 * d->dst_pitch);
+    }
+    if (z) {
+        r300_gl_dbind_range(s, s->zb.off, s->zb.off +
+                            QEMU_ALIGN_UP((uint64_t)y1, 16) * s->zb.pitch *
+                            (s->zb.z16 ? 2 : 4) * (s->zb.aa ? 2 : 1));
+    }
+    return true;
 }
 
 /*
@@ -7511,7 +7586,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     }
     /*
      * A backend that blends each primitive against what the previous one
-     * left (Metal's framebuffer fetch: ati_r350_gl_ordered()) renders a
+     * left (Metal's raster order groups: ati_r350_gl_ordered()) renders a
      * self-overlapping blended draw in one go, exactly. No partition, no
      * passes, and no add-blend approximation are needed for it.
      */
@@ -7651,16 +7726,44 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
      * which the draw can still be refused: everything above it is pure
      * inspection, nothing has been seeded, and a fallback costs nothing.
      */
-    if (!r300_gl_bind(s, d, xr, x0, y0, x1, y1)) {
-        return r300_gl_fallback(s, R350_GLF_SURFACE, prim, nvtx);
-    }
-    if (gpuz && !r300_gl_zbind(s, x0, y0, x1, y1)) {
-        return r300_gl_fallback(s, R350_GLF_BACKEND, prim, nvtx);
+    if (s->gl_direct) {
+        /* zero-copy needs one swap over the whole depth buffer */
+        if (gpuz && !d->zb_xr_ok) {
+            return r300_gl_fallback(s, R350_GLF_XOR, prim, nvtx);
+        }
+        if (!r300_gl_dbind(s, d, gpuz, y0, x1, y1)) {
+            return r300_gl_fallback(s, R350_GLF_SURFACE, prim, nvtx);
+        }
+    } else {
+        if (!r300_gl_bind(s, d, xr, x0, y0, x1, y1)) {
+            return r300_gl_fallback(s, R350_GLF_SURFACE, prim, nvtx);
+        }
+        if (gpuz && !r300_gl_zbind(s, x0, y0, x1, y1)) {
+            return r300_gl_fallback(s, R350_GLF_BACKEND, prim, nvtx);
+        }
     }
 
     req.x0 = x0; req.y0 = y0; req.w = w; req.h = h;
-    req.surf_w = s->gl_tex_w;
-    req.surf_h = s->gl_tex_h;
+    if (s->gl_direct) {
+        /*
+         * One fixed surface covering every coordinate a draw can have,
+         * so the backend never has to start a new pass for a new size.
+         */
+        req.surf_w = R300_GL_SURF_MAX;
+        req.surf_h = R300_GL_SURF_MAX;
+        req.cb_off = d->dst_off;
+        req.cb_pitch = d->dst_pitch;
+        req.cb_xr = xr;
+        req.z_off = s->zb.off;
+        req.z_pitch = s->zb.pitch;
+        req.z_macro = s->zb.macro;
+        req.z_micro = s->zb.micro;
+        req.z_aa = s->zb.aa;
+        req.z_xr = d->zb_xr;
+    } else {
+        req.surf_w = s->gl_tex_w;
+        req.surf_h = s->gl_tex_h;
+    }
     req.verts = s->gl_verts;
     req.nvert = ntri * 3;
     req.pass = npass > 1 ? s->gl_pass_first : NULL;
@@ -7746,6 +7849,21 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         r300_gl_discard(s);
         /* the rasterizer wrote the Z buffer in VRAM too */
         r300_gl_zdiscard(s);
+        return R300_GL_DRAWN;
+    }
+    if (s->gl_direct) {
+        /*
+         * GPU stores set no dirty bit, so the display is told here, for
+         * the rows the draw can have written. It reads them only after a
+         * release has waited for the GPU.
+         */
+        if (shade) {
+            uint64_t lo = d->dst_off + (uint64_t)y0 * d->dst_pitch;
+            uint64_t hi = d->dst_off + (uint64_t)y1 * d->dst_pitch;
+
+            memory_region_set_dirty(&s->vram, lo & ~7ull,
+                                    ((hi + 7) & ~7ull) - (lo & ~7ull));
+        }
         return R300_GL_DRAWN;
     }
     if (gpuz && (s->zb.z_wr || s->zb.s_en)) {

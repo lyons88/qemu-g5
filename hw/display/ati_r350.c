@@ -4423,6 +4423,24 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                        s->gl_api ? s->gl_api : "", why);
             return;
         }
+        if (ati_r350_gl_direct(s->gl_ctx)) {
+            /*
+             * Zero-copy: the backend renders into VRAM itself. gl=verify
+             * runs both paths into a separate copy and diffs them, which
+             * has no meaning when the GPU writes VRAM directly.
+             */
+            if (s->gl_mode == R350_GL_VERIFY) {
+                error_setg(errp, "gl=verify is not available with "
+                           "gl-api=metal, which renders into VRAM directly");
+                return;
+            }
+            if (!ati_r350_gl_vram(s->gl_ctx, memory_region_get_ram_ptr(&s->vram),
+                                  ATI_R350_VRAM_SIZE)) {
+                error_setg(errp, "gl-api=metal: could not map VRAM for the GPU");
+                return;
+            }
+            s->gl_direct = true;
+        }
         trace_ati_r350_gl_open(ati_r350_gl_describe(s->gl_ctx));
     }
     s->gl_pgbits = qemu_target_page_bits();
@@ -5051,6 +5069,10 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
             g_string_append_printf(out, "\nmetal: %" PRIu64 " draws in %"
                                    PRIu64 " command buffers, %" PRIu64
                                    " render passes", qu, qf, qw);
+            if (s->gl_direct) {
+                g_string_append_printf(out, "\nzero-copy: %" PRIu64
+                                       " GPU waits", s->gl_dsyncs);
+            }
             g_string_append_printf(out, "\ndepth buffer: %" PRIu64
                                    " flushes, %" PRIu64 " px out, %" PRIu64
                                    " px in, %" PRIu64 " clears on the GPU",

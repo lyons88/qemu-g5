@@ -55,6 +55,9 @@ bool r350_mtl_zseed(R350MtlCtx *g, int x0, int y0, int w, int h,
                     const uint32_t *z);
 bool r350_mtl_zfetch(R350MtlCtx *g, int x0, int y0, int w, int h,
                      uint32_t *z);
+/* zero-copy: emulated VRAM as the backend's own buffer */
+bool r350_mtl_vram(R350MtlCtx *g, void *ptr, uint64_t size);
+bool r350_mtl_sync(R350MtlCtx *g);
 #endif
 
 #endif /* ATI_R350_GPU_H */

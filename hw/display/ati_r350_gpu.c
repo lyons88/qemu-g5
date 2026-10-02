@@ -104,6 +104,31 @@ bool ati_r350_gl_depth(R350GlCtx *g)
     return g && g->api == R350_GPU_MTL;
 }
 
+bool ati_r350_gl_direct(R350GlCtx *g)
+{
+    return g && g->api == R350_GPU_MTL;
+}
+
+bool ati_r350_gl_vram(R350GlCtx *g, void *ptr, uint64_t size)
+{
+#ifdef CONFIG_DARWIN
+    if (g && g->api == R350_GPU_MTL) {
+        return r350_mtl_vram(g->mtl, ptr, size);
+    }
+#endif
+    return false;
+}
+
+bool ati_r350_gl_wait(R350GlCtx *g)
+{
+#ifdef CONFIG_DARWIN
+    if (g && g->api == R350_GPU_MTL) {
+        return r350_mtl_sync(g->mtl);
+    }
+#endif
+    return true;
+}
+
 bool ati_r350_gl_zseed(R350GlCtx *g, int x0, int y0, int w, int h,
                        const uint32_t *z)
 {

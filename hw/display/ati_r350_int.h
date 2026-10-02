@@ -718,6 +718,16 @@ struct ATIR350State {
      * tests `gl_res` covers it too. The layout fields are the ZB_*
      * decode it was seeded under; a draw naming another one flushes it.
      */
+    /*
+     * ZERO-COPY (ati_r350_gl_direct()). The GPU renders into VRAM itself;
+     * `gl_res` then means "draws are submitted that may not have landed",
+     * and [gl_dlo, gl_dhi) is every VRAM byte they can write. A reader
+     * or writer of a range that meets it waits for the GPU first; nothing
+     * is ever copied.
+     */
+    bool gl_direct;
+    uint64_t gl_dlo, gl_dhi;
+    uint64_t gl_dsyncs;
     bool gl_zres;
     uint32_t gl_z_off, gl_z_pitch;
     bool gl_z_macro, gl_z_aa, gl_z_z16;

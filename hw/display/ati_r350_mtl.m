@@ -1,39 +1,25 @@
 /*
- * ATI R300/R350 -- the Metal rendering backend.
+ * ATI R300/R350 -- the Metal rendering backend, ZERO-COPY.
  *
- * The same contract as ati_r350_gl.c (see ati_r350_gl.h), the same
- * shading, and one thing GL on this host could never do: the fragment
- * shader reads the pixel it is about to write. On an Apple GPU that is
- * framebuffer fetch -- the colour attachment is an input to the shader,
- * `[[color(0)]]` -- and the hardware guarantees that fragments landing
- * on one pixel run in primitive order, each seeing what the one before
- * it left. That is exactly what the device does, so:
+ * An Apple GPU shares memory with the CPU, so emulated VRAM is handed to
+ * Metal as a buffer over the very same pages (ati_r350_gl_vram()), and
+ * the fragment stage reads and writes the guest's colour and depth
+ * buffers in it directly: the device's own byte lanes (the aperture
+ * swapper, `lanes()`), the device's own tiled depth layout (`zaddr()`,
+ * r300_zaddr() transcribed). There is no render target, nothing is
+ * seeded and nothing is fetched. Making VRAM coherent for a reader is
+ * waiting for the GPU (ati_r350_gl_wait()), which the caller does at
+ * exactly the points the copy-based design used to copy.
  *
- *   - the blend is still computed in the shader, with the device's
- *     truncating pack, but against the LIVE destination rather than a
- *     snapshot. There is no dst copy, no texture barrier, no draw
- *     queue sorted into waves, and no pass partition: a self-overlapping
- *     blended draw is one draw call and blends the way the chip does.
- *     ati_r350_gl_ordered() tells the caller so, and it stops
- *     partitioning (and stops falling back when the partition refuses).
- *   - gl=fast's add-blend is not needed and is not used: the exact path
- *     is already one pass. A request with add_blend set is rendered
- *     exactly.
- *   - the colour write mask is applied in the shader too (the unmasked
- *     channels keep the fetched value), so one pipeline serves every
- *     mask and the pipeline cache is keyed on the program alone.
- *
- * THE DEPTH BUFFER is a second colour attachment, R32Uint, holding each
- * pixel's Z word exactly as VRAM holds it -- (z24 << 8) | stencil, or
- * the 16-bit Z -- and read by the same framebuffer fetch. The depth and
- * stencil test is r300_zb_pixel() in the shader, in its place in the
- * software path's order (after the alpha test, before DISCARD_SRC and
- * the blend), with integer compares and the device's stencil ops; a
- * fragment that fails still writes its stencil result and leaves the
- * colour alone. Metal's own depth test is not used: it cannot do the
- * device's 24-bit integer compare or its quantisation of Z. The caller
- * untiles and seeds it, and flushes it back, under the colour target's
- * rules (see "GL-OWNED DEPTH BUFFER" in ati_r350_3d.c).
+ * ORDER. The render pass has no attachments; the fragment stage writes
+ * VRAM through pointers in raster order group 0, and an Apple GPU runs
+ * the fragments that land on one pixel in primitive order, each seeing
+ * what the one before it left. So the depth and stencil test, the blend
+ * against the destination and the colour write mask are all done in the
+ * shader in r300_raster_tri()'s own order -- alpha test, depth and
+ * stencil (a failing fragment still writes its stencil result), discard,
+ * blend, truncating pack -- and a self-overlapping blended draw is one
+ * draw call that blends the way the device does.
  *
  * THE ARITHMETIC is Cat_7's, statement for statement: the fragment
  * shader below is fs_src from ati_r350_gl.c rewritten in MSL, including
@@ -50,19 +36,13 @@
  * MSL, and the one `out vec4 outc` becomes a reference. The translator
  * stays the single source for both backends.
  *
- * COORDINATES are the device's with no flip, as in GL: target row k is
- * device row k. Metal's framebuffer origin is top-left, so the vertex
- * stage negates the NDC y GL computes -- the viewport transform then
- * yields the same window y bit for bit -- and [[position]] is the
- * device pixel plus a half, which is what gl_FragCoord was.
+ * COORDINATES are the device's, unflipped: the vertex stage negates the
+ * NDC y GL computes, so Metal's top-left raster puts device row k on
+ * raster row k, and [[position]] is the device pixel plus a half.
  *
- * RESIDENCY. The target is a private RGBA8Uint texture that lives on
- * the GPU. Seeds and fetches are blits in the same command stream as
- * the draws, so they are ordered with them without the CPU waiting;
- * only a fetch waits, because its bytes are needed now. Draws stay in
- * one render pass until something outside it (a seed, a fetch, a new
- * target) has to happen, and command buffers are committed without
- * waiting in between.
+ * TEXTURES are still decoded by the caller and uploaded; vertices go
+ * through per-command-buffer arenas. Both are copies of data the GPU
+ * only reads.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -85,6 +65,8 @@
 #define ati_r350_gl_queue_stats r350_mtl_queue_stats
 #define ati_r350_gl_zseed       r350_mtl_zseed
 #define ati_r350_gl_zfetch      r350_mtl_zfetch
+#define ati_r350_gl_vram        r350_mtl_vram
+#define ati_r350_gl_wait        r350_mtl_sync
 #include "ati_r350_gpu.h"
 
 #import <Metal/Metal.h>
@@ -122,7 +104,10 @@ enum {
     /* the depth and stencil test, as R350GlReq carries it */
     IV_ZMODE, IV_ZTEST, IV_ZWR, IV_SEN, IV_SFB, IV_ZSC, IV_SREF, IV_SMASK,
     IV_SWMASK,
-    IV_N = 28
+    /* zero-copy: where the buffers are in VRAM */
+    IV_CBOFF, IV_CBPITCH, IV_CBX, IV_ZOFF, IV_ZPITCH, IV_ZMACRO, IV_ZMICRO,
+    IV_ZAA, IV_ZX, IV_VSZ,
+    IV_N = 40
 };
 
 typedef struct MtlFsU {
@@ -141,10 +126,12 @@ struct R350MtlCtx {
     id<MTLBuffer> n255;                 /* k / 255.0f, as the host rounds it */
     id<MTLTexture> white;               /* what an untextured draw binds */
 
-    /* the resident target */
-    id<MTLTexture> cbuf;
-    id<MTLTexture> zbuf;                /* one Z word per pixel, R32Uint */
-    int fb_w, fb_h;
+    /*
+     * Emulated VRAM itself, wrapped without a copy: the fragment stage
+     * reads and writes the guest's colour and depth buffers in it.
+     */
+    id<MTLBuffer> vbuf;
+    uint64_t vsz;
 
     /* uploaded textures by caller slot, plus the scratch at the end */
     id<MTLTexture> tex[R350_GL_TEXSLOTS + 1];
@@ -185,9 +172,6 @@ struct R350MtlCtx {
     MtlFlight fl[MTL_INFLIGHT];
     unsigned fl_head, fl_n;
 
-    id<MTLBuffer> rb;                   /* readback */
-    size_t rb_sz;
-
     uint64_t draws, cbs, passes;
     char desc[160];
 };
@@ -227,7 +211,7 @@ static const char *mtl_body =
 "    float pad1;\n"
 "    float pad2;\n"
 "    int tf[16];\n"
-"    int iv[28];\n"
+"    int iv[40];\n"
 "};\n"
 "#define IV_TEXW 0\n"
 "#define IV_TEXH 1\n"
@@ -255,6 +239,16 @@ static const char *mtl_body =
 "#define IV_SREF 23\n"
 "#define IV_SMASK 24\n"
 "#define IV_SWMASK 25\n"
+"#define IV_CBOFF 26\n"
+"#define IV_CBPITCH 27\n"
+"#define IV_CBX 28\n"
+"#define IV_ZOFF 29\n"
+"#define IV_ZPITCH 30\n"
+"#define IV_ZMACRO 31\n"
+"#define IV_ZMICRO 32\n"
+"#define IV_ZAA 33\n"
+"#define IV_ZX 34\n"
+"#define IV_VSZ 35\n"
 "\n"
 "struct VOut {\n"
 "    float4 pos [[position]];\n"
@@ -524,19 +518,70 @@ static const char *mtl_body =
 "    }\n"
 "}\n"
 "\n"
-"struct FOut {\n"
-"    uint4 c [[color(0)]];\n"
-"    uint z [[color(1)]];\n"
-"};\n"
+/*
+ * VRAM. A dword through the aperture swapper: byte i of the value is
+ * memory byte (i ^ x) of its aligned dword -- r300_ld32() -- and the
+ * same permutation stores it back, being its own inverse.
+ */
+"static uint lanes(uint w, uint x)\n"
+"{\n"
+"    if (x == 0u) return w;\n"
+"    uint b0 = w & 0xffu, b1 = (w >> 8) & 0xffu;\n"
+"    uint b2 = (w >> 16) & 0xffu, b3 = w >> 24;\n"
+"    uint b[4] = { b0, b1, b2, b3 };\n"
+"    return b[0u ^ x] | (b[1u ^ x] << 8) | (b[2u ^ x] << 16) |\n"
+"           (b[3u ^ x] << 24);\n"
+"}\n"
 "\n"
-"fragment FOut r350_fs(VOut in [[stage_in]],\n"
-"                      uint4 dst [[color(0)]],\n"
-"                      uint zin [[color(1)]],\n"
+/* r300_zaddr(), the depth buffer's tiled layout */
+"static uint zaddr(constant FsU &u, uint x, uint y, uint smp)\n"
+"{\n"
+"    uint off = uint(u.iv[IV_ZOFF]), pitch = uint(u.iv[IV_ZPITCH]);\n"
+"    bool macro = u.iv[IV_ZMACRO] != 0, micro = u.iv[IV_ZMICRO] != 0;\n"
+"    uint a;\n"
+"    if (!macro && !micro) return off + (y * pitch + x) * 4u;\n"
+"    if (u.iv[IV_ZAA] != 0) {\n"
+"        a = ((x & 1u) << 2) | ((y & 1u) << 3) | (smp << 4);\n"
+"        if (macro) {\n"
+"            a |= (((x >> 1) & 1u) << 5) | (((y >> 1) & 3u) << 6) |\n"
+"                 (((x >> 2) & 7u) << 8);\n"
+"            a += ((y >> 3) * (pitch / 32u) + (x >> 5)) * 2048u;\n"
+"        } else {\n"
+"            a += ((y >> 1) * (pitch / 2u) + (x >> 1)) * 32u;\n"
+"        }\n"
+"    } else {\n"
+"        a = ((x & 1u) << 2) | (((x >> 1) & 1u) << 3) | ((y & 1u) << 4);\n"
+"        if (macro) {\n"
+"            a |= (((x >> 2) & 1u) << 5) | (((y >> 1) & 3u) << 6) |\n"
+"                 (((x >> 3) & 3u) << 8) | (((y >> 3) & 1u) << 10);\n"
+"            a += ((y >> 4) * (pitch / 32u) + (x >> 5)) * 2048u;\n"
+"        } else {\n"
+"            a += ((y >> 1) * (pitch / 4u) + (x >> 2)) * 32u;\n"
+"        }\n"
+"    }\n"
+"    return off + a;\n"
+"}\n"
+"\n"
+/*
+ * The fragment stage writes emulated VRAM itself. raster_order_group(0)
+ * is what makes that exact: fragments landing on one pixel run their
+ * reads and writes of it in primitive order, each seeing what the one
+ * before it left -- the device's own order, with no render target.
+ */
+"fragment void r350_fs(VOut in [[stage_in]],\n"
 "                      constant FsU &u [[buffer(0)]],\n"
 "                      constant float4 *USK [[buffer(1)]],\n"
 "                      constant float *N255 [[buffer(2)]],\n"
+"                      device uint *vram [[buffer(3), raster_order_group(0)]],\n"
+"                      device uchar *vram8 [[buffer(4), raster_order_group(0)]],\n"
 "                      texture2d<uint, access::read> tex [[texture(0)]])\n"
 "{\n"
+"    uint pxi = uint(in.pos.x), pyi = uint(in.pos.y);\n"
+"    uint vsz = uint(u.iv[IV_VSZ]);\n"
+"    uint wm = uint(u.iv[IV_WMASK]);\n"
+"    uint caddr = uint(u.iv[IV_CBOFF]) + pyi * uint(u.iv[IV_CBPITCH]) +\n"
+"                 pxi * 4u;\n"
+"    uint cbx = uint(u.iv[IV_CBX]);\n"
 "    float4 c;\n"
 "    float ts, tt;\n"
 /* r300_raster_tri()'s own weights, expression for expression */
@@ -630,21 +675,33 @@ static const char *mtl_body =
  * test fails is NOT discarded here: the stencil op on failure still
  * writes, so it goes through with its colour left as it was.
  */
-"    uint zout = zin;\n"
 "    bool live = true;\n"
 "    if (u.iv[IV_ZMODE] != 0) {\n"
+"        uint zx = uint(u.iv[IV_ZX]);\n"
 "        float zf = fma(sw2, in.zb.z, fma(sw1, in.zb.y, sw0 * in.zb.x));\n"
 "        float zt = zf > 0.0f ? zf : 0.0f;\n"
 "        zt = zt < 1.0f ? zt : 1.0f;\n"
 "        uint zfn = uint(u.iv[IV_ZSC]) & 7u;\n"
 "        bool ztest = u.iv[IV_ZTEST] != 0, zwr = u.iv[IV_ZWR] != 0;\n"
 "        if (u.iv[IV_ZMODE] == 2) {\n"
-"            uint zold = zin & 0xffffu;\n"
-"            uint znew = uint(zt * 65535.0f);\n"
-"            bool zpass = !ztest || zs_cmp(zfn, znew, zold);\n"
-"            if (zpass && zwr) zout = znew;\n"
-"            live = zpass;\n"
+/* 16-bit Z: linear, byte by byte through the swapper */
+"            uint za = uint(u.iv[IV_ZOFF]) +\n"
+"                      (pyi * uint(u.iv[IV_ZPITCH]) + pxi) * 2u;\n"
+"            if (za + 2u <= vsz) {\n"
+"                uint zold = uint(vram8[za ^ zx]) |\n"
+"                            (uint(vram8[(za + 1u) ^ zx]) << 8);\n"
+"                uint znew = uint(zt * 65535.0f);\n"
+"                bool zpass = !ztest || zs_cmp(zfn, znew, zold);\n"
+"                if (zpass && zwr && znew != zold) {\n"
+"                    vram8[za ^ zx] = uchar(znew & 0xffu);\n"
+"                    vram8[(za + 1u) ^ zx] = uchar(znew >> 8);\n"
+"                }\n"
+"                live = zpass;\n"
+"            }\n"
 "        } else {\n"
+"            uint za = zaddr(u, pxi, pyi, 0u);\n"
+"            if (za + 4u <= vsz) {\n"
+"            uint zin = lanes(vram[za >> 2], zx);\n"
 "            uint zold = zin >> 8, sold = zin & 0xffu, snew = sold;\n"
 "            uint znew = uint(zt * 16777215.0f);\n"
 "            bool zpass = !ztest || zs_cmp(zfn, znew, zold);\n"
@@ -662,8 +719,16 @@ static const char *mtl_body =
 "                snew = (sold & ~swm) | (snew & swm);\n"
 "            }\n"
 "            if (!(spass && zpass && zwr)) znew = zold;\n"
-"            zout = (znew << 8) | snew;\n"
+"            if (znew != zold || snew != sold) {\n"
+"                uint val = lanes((znew << 8) | snew, zx);\n"
+"                vram[za >> 2] = val;\n"
+"                if (u.iv[IV_ZAA] != 0) {\n"
+"                    uint zb = zaddr(u, pxi, pyi, 1u);\n"
+"                    if (zb + 4u <= vsz) vram[zb >> 2] = val;\n"
+"                }\n"
+"            }\n"
 "            live = spass && zpass;\n"
+"            }\n"
 "        }\n"
 "    }\n"
 "    if (live && u.iv[IV_DISCARD] != 0) {\n"
@@ -683,12 +748,14 @@ static const char *mtl_body =
 "    }\n"
 /*
  * The blend, against the pixel as the previous primitive left it --
- * framebuffer fetch, in primitive order. Cat_7's expressions verbatim.
+ * read from VRAM in raster order. Cat_7's expressions verbatim.
  */
-"    if (live && u.iv[IV_BLEND] != 0) {\n"
+"    if (!live || wm == 0u || caddr + 4u > vsz) return;\n"
+"    uint dv = lanes(vram[caddr >> 2], cbx);\n"
+"    if (u.iv[IV_BLEND] != 0) {\n"
 "        float4 d = u.iv[IV_BREAD] != 0\n"
-"                   ? float4(N255[dst.r], N255[dst.g], N255[dst.b],\n"
-"                            N255[dst.a])\n"
+"                   ? float4(N255[(dv >> 16) & 0xffu], N255[(dv >> 8) & 0xffu],\n"
+"                            N255[dv & 0xffu], N255[dv >> 24])\n"
 "                   : float4(0.0f);\n"
 "        int cs = u.iv[IV_CSRC], cd = u.iv[IV_CDST], cf = u.iv[IV_CCOMB];\n"
 "        int as = u.iv[IV_ASRC], ad = u.iv[IV_ADST], af = u.iv[IV_ACOMB];\n"
@@ -709,14 +776,10 @@ static const char *mtl_body =
 "    }\n"
 /* the device's truncating pack, then RB3D_COLOR_CHANNEL_MASK */
 "    uint4 o = uint4(floor(r3_clamp(c, 0.0f, 1.0f) * 255.0f));\n"
-"    uint wm = uint(u.iv[IV_WMASK]);\n"
-"    bool4 wr = bool4((wm & 0x00ff0000u) != 0u, (wm & 0x0000ff00u) != 0u,\n"
-"                     (wm & 0x000000ffu) != 0u, (wm & 0xff000000u) != 0u);\n"
-"    if (!live) wr = bool4(false);\n"
-"    FOut f;\n"
-"    f.c = select(dst, o, wr);\n"
-"    f.z = zout;\n"
-"    return f;\n"
+"    uint argb = (o.a << 24) | (o.r << 16) | (o.g << 8) | o.b;\n"
+/* r300_write_dst(): masked channels keep what the destination holds */
+"    argb = (argb & wm) | (dv & ~wm);\n"
+"    vram[caddr >> 2] = lanes(argb, cbx);\n"
 "}\n";
 
 /*
@@ -846,10 +909,7 @@ static id<MTLRenderPipelineState> mtl_build(R350MtlCtx *g, const char *us,
     pd = [[MTLRenderPipelineDescriptor alloc] init];
     pd.vertexFunction = vf;
     pd.fragmentFunction = ff;
-    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Uint;
-    pd.colorAttachments[0].blendingEnabled = NO;
-    pd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
-    pd.colorAttachments[1].blendingEnabled = NO;
+    /* no attachments: the fragment stage writes VRAM, see r350_fs */
     e = nil;
     pso = (vf && ff) ? [g->dev newRenderPipelineStateWithDescriptor:pd
                                                               error:&e]
@@ -968,24 +1028,34 @@ static bool mtl_submit(R350MtlCtx *g, bool wait)
 }
 
 /* the open render pass, begun on the resident target if there is none */
-static id<MTLRenderCommandEncoder> mtl_enc(R350MtlCtx *g)
+/*
+ * The open render pass, begun if there is none: attachment-less, `w` x
+ * `h` pixels of raster, with VRAM bound for the fragment stage. A
+ * different size ends the pass and starts another.
+ */
+static id<MTLRenderCommandEncoder> mtl_enc(R350MtlCtx *g, int w, int h)
 {
+    if (g->enc && (g->enc_vw != w || g->enc_vh != h)) {
+        mtl_end_enc(g);
+    }
     if (!g->enc) {
         MTLRenderPassDescriptor *rp =
             [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLViewport vp = { 0.0, 0.0, (double)w, (double)h, 0.0, 1.0 };
 
-        rp.colorAttachments[0].texture = g->cbuf;
-        rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        rp.colorAttachments[1].texture = g->zbuf;
-        rp.colorAttachments[1].loadAction = MTLLoadActionLoad;
-        rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+        rp.renderTargetWidth = w;
+        rp.renderTargetHeight = h;
+        rp.defaultRasterSampleCount = 1;
         g->enc = [[mtl_cb(g) renderCommandEncoderWithDescriptor:rp] retain];
         [g->enc setFragmentBuffer:g->n255 offset:0 atIndex:2];
+        [g->enc setFragmentBuffer:g->vbuf offset:0 atIndex:3];
+        [g->enc setFragmentBuffer:g->vbuf offset:0 atIndex:4];
+        [g->enc setViewport:vp];
         g->enc_pso = nil;
         g->enc_vb = nil;
         g->enc_tex = nil;
-        g->enc_vw = g->enc_vh = -1;
+        g->enc_vw = w;
+        g->enc_vh = h;
         g->passes++;
     }
     return g->enc;
@@ -1030,43 +1100,6 @@ static id<MTLBuffer> mtl_alloc(R350MtlCtx *g, size_t len, size_t *off)
     return g->arena;
 }
 
-/*
- * Copy [x0,x0+w) x [y0,y0+h) of the target out, packed RGBA rows, and
- * wait for it. Returns the bytes, valid until the next call, or NULL.
- */
-static const uint8_t *mtl_read(R350MtlCtx *g, id<MTLTexture> t,
-                               int x0, int y0, int w, int h)
-{
-    size_t need = (size_t)w * h * 4;
-    id<MTLBlitCommandEncoder> b;
-
-    if (need > g->rb_sz) {
-        [g->rb release];
-        g->rb = [g->dev newBufferWithLength:need
-                                    options:MTLResourceStorageModeShared];
-        g->rb_sz = g->rb ? need : 0;
-        if (!g->rb) {
-            return NULL;
-        }
-    }
-    mtl_end_enc(g);
-    b = [mtl_cb(g) blitCommandEncoder];
-    [b copyFromTexture:t
-           sourceSlice:0
-           sourceLevel:0
-          sourceOrigin:MTLOriginMake(x0, y0, 0)
-            sourceSize:MTLSizeMake(w, h, 1)
-              toBuffer:g->rb
-     destinationOffset:0
-destinationBytesPerRow:(NSUInteger)w * 4
-destinationBytesPerImage:need];
-    [b endEncoding];
-    if (!mtl_submit(g, true)) {
-        return NULL;
-    }
-    return g->rb.contents;
-}
-
 /* ------------------------------------------------------------------ */
 
 R350MtlCtx *ati_r350_gl_open(const char **err)
@@ -1092,10 +1125,11 @@ R350MtlCtx *ati_r350_gl_open(const char **err)
          * it is not reproduced here, so such a host is refused and
          * gl-api=opengl remains the way to run it.
          */
-        if (![dev supportsFamily:MTLGPUFamilyApple1]) {
+        if (![dev supportsFamily:MTLGPUFamilyApple1] ||
+            !dev.rasterOrderGroupsSupported || !dev.hasUnifiedMemory) {
             [dev release];
-            *err = "gl-api=metal needs an Apple-silicon GPU "
-                   "(framebuffer fetch); use gl-api=opengl";
+            *err = "gl-api=metal needs an Apple-silicon GPU (unified "
+                   "memory, raster order groups); use gl-api=opengl";
             return NULL;
         }
         g = g_new0(R350MtlCtx, 1);
@@ -1139,7 +1173,7 @@ R350MtlCtx *ati_r350_gl_open(const char **err)
         }
         [probe release];
         snprintf(g->desc, sizeof(g->desc),
-                 "Metal, %s, framebuffer fetch", dev.name.UTF8String);
+                 "Metal, %s, zero-copy VRAM", dev.name.UTF8String);
     }
     return g;
 }
@@ -1159,10 +1193,8 @@ void ati_r350_gl_close(R350MtlCtx *g)
         for (k = 0; k <= R350_GL_TEXSLOTS; k++) {
             [g->tex[k] release];
         }
-        [g->rb release];
         [g->arena_free release];
-        [g->cbuf release];
-        [g->zbuf release];
+        [g->vbuf release];
         [g->white release];
         [g->n255 release];
         [g->q release];
@@ -1184,7 +1216,7 @@ void ati_r350_gl_prog_stats(R350MtlCtx *g, uint64_t *hits, uint64_t *links,
     *failed = g ? g->prog_failed : 0;
 }
 
-/* nothing to barrier: framebuffer fetch is ordered by the hardware */
+/* nothing to barrier: raster order groups keep each pixel in order */
 uint64_t ati_r350_gl_barriers(R350MtlCtx *g)
 {
     return 0;
@@ -1199,191 +1231,75 @@ void ati_r350_gl_queue_stats(R350MtlCtx *g, uint64_t *units,
     *waves = g ? g->passes : 0;
 }
 
+/*
+ * ZERO-COPY. There is no resident target: the draws write emulated VRAM
+ * where it is, so the copy-based half of the interface has nothing to
+ * do. The caller never calls it for a direct backend; these answer
+ * honestly if it ever does.
+ */
 bool ati_r350_gl_target(R350MtlCtx *g, int w, int h, bool *lost)
 {
-    MTLTextureDescriptor *d;
-    id<MTLTexture> t, z;
-
     *lost = false;
-    if (!g || w <= 0 || h <= 0) {
-        return false;
-    }
-    if (w <= g->fb_w && h <= g->fb_h) {
-        return true;
-    }
-    /* grow only, as the GL backend does, and say the contents went */
-    w = MAX(w, g->fb_w);
-    h = MAX(h, g->fb_h);
-    if (w > 16384 || h > 16384) {
-        return false;
-    }
-    @autoreleasepool {
-        mtl_end_enc(g);
-        d = [MTLTextureDescriptor
-             texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Uint
-                                          width:w
-                                         height:h
-                                      mipmapped:NO];
-        d.storageMode = MTLStorageModePrivate;
-        d.usage = MTLTextureUsageRenderTarget;
-        t = [g->dev newTextureWithDescriptor:d];
-        d.pixelFormat = MTLPixelFormatR32Uint;
-        z = [g->dev newTextureWithDescriptor:d];
-        if (!t || !z) {
-            [t release];
-            [z release];
-            return false;
-        }
-        mtl_hold(g, g->cbuf);
-        mtl_hold(g, g->zbuf);
-        [g->cbuf release];
-        [g->zbuf release];
-        g->cbuf = t;
-        g->zbuf = z;
-        g->fb_w = w;
-        g->fb_h = h;
-    }
-    *lost = true;
-    return true;
+    return g && w > 0 && h > 0 && w <= 16384 && h <= 16384;
 }
 
-/*
- * VRAM into the target: permuted into RGBA on the CPU (see the GL
- * backend's measurement of why), then a blit in the command stream, so
- * it lands after every draw already encoded and before every later one.
- */
 bool ati_r350_gl_seed(R350MtlCtx *g, int x0, int y0, int w, int h,
                       const uint8_t *base, unsigned pitch, unsigned xr)
 {
-    size_t need = (size_t)w * h * 4, off = 0;
-    id<MTLBlitCommandEncoder> b;
-    id<MTLBuffer> sb;
-    uint8_t *st;
-    int x, y;
-
-    if (!g || w <= 0 || h <= 0 ||
-        x0 < 0 || y0 < 0 || x0 + w > g->fb_w || y0 + h > g->fb_h) {
-        return false;
-    }
-    @autoreleasepool {
-        sb = mtl_alloc(g, need, &off);
-        if (!sb) {
-            return false;
-        }
-        st = (uint8_t *)sb.contents + off;
-        for (y = 0; y < h; y++) {
-            const uint8_t *p = base + (size_t)(y0 + y) * pitch +
-                               (size_t)x0 * 4;
-            uint8_t *o = st + (size_t)y * w * 4;
-
-            for (x = 0; x < w; x++, p += 4, o += 4) {
-                o[0] = p[2 ^ xr];       /* R */
-                o[1] = p[1 ^ xr];       /* G */
-                o[2] = p[0 ^ xr];       /* B */
-                o[3] = p[3 ^ xr];       /* A */
-            }
-        }
-        mtl_end_enc(g);
-        b = [mtl_cb(g) blitCommandEncoder];
-        [b copyFromBuffer:sb
-             sourceOffset:off
-        sourceBytesPerRow:(NSUInteger)w * 4
-      sourceBytesPerImage:need
-               sourceSize:MTLSizeMake(w, h, 1)
-                toTexture:g->cbuf
-         destinationSlice:0
-         destinationLevel:0
-        destinationOrigin:MTLOriginMake(x0, y0, 0)];
-        [b endEncoding];
-    }
-    return !g->failed;
+    return false;
 }
 
 bool ati_r350_gl_fetch(R350MtlCtx *g, int x0, int y0, int w, int h,
                        uint8_t *base, unsigned pitch, unsigned xr)
 {
-    const uint8_t *st;
-    int x, y;
-
-    if (!g || w <= 0 || h <= 0 ||
-        x0 < 0 || y0 < 0 || x0 + w > g->fb_w || y0 + h > g->fb_h) {
-        return false;
-    }
-    @autoreleasepool {
-        st = mtl_read(g, g->cbuf, x0, y0, w, h);
-    }
-    if (!st) {
-        return false;
-    }
-    for (y = 0; y < h; y++) {
-        uint8_t *p = base + (size_t)(y0 + y) * pitch + (size_t)x0 * 4;
-        const uint8_t *i = st + (size_t)y * w * 4;
-
-        for (x = 0; x < w; x++, p += 4, i += 4) {
-            p[2 ^ xr] = i[0];
-            p[1 ^ xr] = i[1];
-            p[0 ^ xr] = i[2];
-            p[3 ^ xr] = i[3];
-        }
-    }
-    return true;
+    return false;
 }
 
-/*
- * The depth buffer, both ways: packed rows of Z words, no swapper and no
- * tiling -- the caller has already undone both. Blits in the command
- * stream, like the colour target's.
- */
 bool ati_r350_gl_zseed(R350MtlCtx *g, int x0, int y0, int w, int h,
                        const uint32_t *z)
 {
-    size_t need = (size_t)w * h * 4, off = 0;
-    id<MTLBlitCommandEncoder> b;
-    id<MTLBuffer> sb;
-
-    if (!g || !g->zbuf || w <= 0 || h <= 0 ||
-        x0 < 0 || y0 < 0 || x0 + w > g->fb_w || y0 + h > g->fb_h) {
-        return false;
-    }
-    @autoreleasepool {
-        sb = mtl_alloc(g, need, &off);
-        if (!sb) {
-            return false;
-        }
-        memcpy((uint8_t *)sb.contents + off, z, need);
-        mtl_end_enc(g);
-        b = [mtl_cb(g) blitCommandEncoder];
-        [b copyFromBuffer:sb
-             sourceOffset:off
-        sourceBytesPerRow:(NSUInteger)w * 4
-      sourceBytesPerImage:need
-               sourceSize:MTLSizeMake(w, h, 1)
-                toTexture:g->zbuf
-         destinationSlice:0
-         destinationLevel:0
-        destinationOrigin:MTLOriginMake(x0, y0, 0)];
-        [b endEncoding];
-    }
-    return !g->failed;
+    return false;
 }
 
 bool ati_r350_gl_zfetch(R350MtlCtx *g, int x0, int y0, int w, int h,
                         uint32_t *z)
 {
-    const uint8_t *st;
+    return false;
+}
 
-    if (!g || !g->zbuf || w <= 0 || h <= 0 ||
-        x0 < 0 || y0 < 0 || x0 + w > g->fb_w || y0 + h > g->fb_h) {
+/*
+ * Emulated VRAM, as a Metal buffer over the same pages: QEMU's RAM block
+ * is page-aligned and a whole number of pages, which is all
+ * newBufferWithBytesNoCopy asks. The GPU's stores ARE the guest's VRAM.
+ */
+bool ati_r350_gl_vram(R350MtlCtx *g, void *ptr, uint64_t size)
+{
+    if (!g || g->vbuf || ((uintptr_t)ptr & (qemu_real_host_page_size() - 1)) ||
+        (size & (qemu_real_host_page_size() - 1)) || size > UINT32_MAX) {
         return false;
     }
     @autoreleasepool {
-        st = mtl_read(g, g->zbuf, x0, y0, w, h);
+        g->vbuf = [g->dev newBufferWithBytesNoCopy:ptr
+                                            length:size
+                                           options:MTLResourceStorageModeShared
+                                       deallocator:nil];
     }
-    if (!st) {
-        return false;
+    g->vsz = size;
+    return g->vbuf != nil;
+}
+
+/* every draw submitted so far, landed in VRAM */
+bool ati_r350_gl_wait(R350MtlCtx *g)
+{
+    bool ok;
+
+    if (!g) {
+        return true;
     }
-    memcpy(z, st, (size_t)w * h * 4);
-    return true;
+    @autoreleasepool {
+        ok = mtl_submit(g, true);
+    }
+    return ok;
 }
 
 /* the pipeline for this request's fragment program, building on a miss */
@@ -1487,8 +1403,10 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
     float rect[4];
     MtlFsU fu;
 
-    if (!g || r->w <= 0 || r->h <= 0 || !r->nvert || !r->us_glsl ||
-        r->surf_w > g->fb_w || r->surf_h > g->fb_h || g->failed) {
+    /* r->out is gl=verify, which a zero-copy backend cannot serve */
+    if (!g || !g->vbuf || r->out || r->w <= 0 || r->h <= 0 || !r->nvert ||
+        !r->us_glsl || r->surf_w <= 0 || r->surf_h <= 0 ||
+        r->surf_w > 16384 || r->surf_h > 16384 || g->failed) {
         return false;
     }
     @autoreleasepool {
@@ -1513,11 +1431,11 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
             tex = g->white;
         }
 
-        /* scissor, the draw's rectangle, and the attachment's bounds */
+        /* scissor, the draw's rectangle, and the raster's bounds */
         sx0 = MAX(MAX(r->sx0, r->x0), 0);
         sy0 = MAX(MAX(r->sy0, r->y0), 0);
-        sx1 = MIN(MIN(r->sx1, r->x0 + r->w), g->fb_w);
-        sy1 = MIN(MIN(r->sy1, r->y0 + r->h), g->fb_h);
+        sx1 = MIN(MIN(r->sx1, r->x0 + r->w), r->surf_w);
+        sy1 = MIN(MIN(r->sy1, r->y0 + r->h), r->surf_h);
 
         if (sx1 > sx0 && sy1 > sy0) {
             vlen = sizeof(float) * R350_GL_VSTRIDE * r->nvert;
@@ -1565,24 +1483,25 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
             fu.iv[IV_SREF] = r->s_ref;
             fu.iv[IV_SMASK] = r->s_mask;
             fu.iv[IV_SWMASK] = r->s_wmask;
+            fu.iv[IV_CBOFF] = (int32_t)r->cb_off;
+            fu.iv[IV_CBPITCH] = (int32_t)r->cb_pitch;
+            fu.iv[IV_CBX] = (int32_t)r->cb_xr;
+            fu.iv[IV_ZOFF] = (int32_t)r->z_off;
+            fu.iv[IV_ZPITCH] = (int32_t)r->z_pitch;
+            fu.iv[IV_ZMACRO] = r->z_macro;
+            fu.iv[IV_ZMICRO] = r->z_micro;
+            fu.iv[IV_ZAA] = r->z_aa;
+            fu.iv[IV_ZX] = (int32_t)r->z_xr;
+            fu.iv[IV_VSZ] = (int32_t)g->vsz;
             rect[0] = 0.0f;
             rect[1] = 0.0f;
             rect[2] = (float)r->surf_w;
             rect[3] = (float)r->surf_h;
 
-            enc = mtl_enc(g);
+            enc = mtl_enc(g, r->surf_w, r->surf_h);
             if (g->enc_pso != pso) {
                 [enc setRenderPipelineState:pso];
                 g->enc_pso = pso;
-            }
-            if (g->enc_vw != r->surf_w || g->enc_vh != r->surf_h) {
-                MTLViewport vp = {
-                    0.0, 0.0, (double)r->surf_w, (double)r->surf_h, 0.0, 1.0
-                };
-
-                [enc setViewport:vp];
-                g->enc_vw = r->surf_w;
-                g->enc_vh = r->surf_h;
             }
             if (g->enc_vb != vb) {
                 [enc setVertexBuffer:vb offset:voff atIndex:0];
@@ -1624,17 +1543,6 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
             if (++g->cb_draws >= MTL_CB_DRAWS) {
                 mtl_submit(g, false);
             }
-        }
-
-        if (r->out) {
-            /* gl=verify only; the resident target keeps the pixels */
-            const uint8_t *px = mtl_read(g, g->cbuf, r->x0, r->y0, r->w,
-                                         r->h);
-
-            if (!px) {
-                return false;
-            }
-            memcpy(r->out, px, (size_t)r->w * r->h * 4);
         }
     }
     return !g->failed;
