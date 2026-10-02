@@ -1474,7 +1474,9 @@ static uint32_t ati_r350_reg_read32(ATIR350State *s, uint32_t base)
         val = s->pm4_buffer_cntl;
         break;
     case R350_CP_RB_RPTR:
-        val = qatomic_read(&s->pm4_rptr);
+        /* while a read pointer is held back, the register holds it too */
+        val = qatomic_read(&s->gl_defer_n) ? qatomic_read(&s->gl_rptr_pub)
+                                           : qatomic_read(&s->pm4_rptr);
         break;
     case R350_CP_RB_WPTR:
         val = qatomic_read(&s->pm4_wptr);
@@ -2876,6 +2878,8 @@ static void ati_r350_cp_rptr_write(ATIR350State *s, uint32_t val)
     uint32_t reg = s->regs[R350_CP_RB_RPTR_ADDR >> 2];
     uint32_t addr = reg & ~R350_RB_RPTR_SWAP_MASK;
 
+    qatomic_set(&s->gl_rptr_pub, val);
+
     if (!(cntl & R350_RB_NO_UPDATE) && addr) {
         switch (reg & R350_RB_RPTR_SWAP_MASK) {
         case 1:
@@ -2925,7 +2929,11 @@ static bool ati_r350_defer(ATIR350State *s, int n, uint32_t val)
 {
     unsigned k;
 
-    if (!s->gl_async || !s->gl_direct || !s->gl_res) {
+    /*
+     * Once anything is held, everything after it is held too, so the
+     * guest learns them in the order the command stream gave them.
+     */
+    if (!s->gl_async || !s->gl_direct || (!s->gl_res && !s->gl_defer_n)) {
         return false;
     }
     if (n == -2 && !s->gl_defer_n) {
@@ -2990,28 +2998,35 @@ static void ati_r350_defer_poll(ATIR350State *s)
     if (!s->gl_defer_n && s->gl_res && ati_r350_gl_idle(s->gl_ctx)) {
         /* the GPU is idle: nothing of VRAM is pending any more */
         s->gl_res = false;
+        ati_r350_gl_dmark_all(s);
         s->gl_dn = 0;
     }
 }
 
 void ati_r350_defer_flush(ATIR350State *s)
 {
-    bool locked;
+    unsigned k;
 
     if (!s->gl_defer_n) {
         return;
     }
-    locked = bql_locked();
-    if (!locked) {
-        bql_lock();
+    if (!bql_locked()) {
+        /*
+         * Not here: the caller may hold the texture lock, which the
+         * display takes under the BQL. Everything is complete, so mark
+         * it so; the engine loop publishes it before it next idles, and
+         * ati_r350_defer() keeps anything newer queued behind it.
+         */
+        for (k = 0; k < s->gl_defer_n; k++) {
+            s->gl_defer[(s->gl_defer_h + k) % ARRAY_SIZE(s->gl_defer)].serial
+                = 0;
+        }
+        return;
     }
     while (s->gl_defer_n) {
         ati_r350_defer_pub(s, s->gl_defer_h);
         s->gl_defer_h = (s->gl_defer_h + 1) % ARRAY_SIZE(s->gl_defer);
         s->gl_defer_n--;
-    }
-    if (!locked) {
-        bql_unlock();
     }
 }
 
@@ -3067,6 +3082,11 @@ static void ati_r350_pm4_run(ATIR350State *s)
         s->gl_defer_rings++;
         return;
     }
+    if (ati_r350_on_engine() && s->gl_defer_n) {
+        /* the queue is full: wait, and let everything before this out */
+        ati_r350_gl_release(s, R350_GLR_RING);
+        ati_r350_defer_poll(s);
+    }
     /*
      * A whole ring is drained inside the guest store that kicked it, so
      * this is the first moment the guest CPU could look at VRAM again --
@@ -3108,7 +3128,7 @@ static void ati_r350_pm4_run_ring(ATIR350State *s)
          * left on the GPU.
          */
         if (ati_r350_on_engine() && ++s->engine_rptr_wb >= 256 &&
-            !s->pm4_ring.remaining && !s->gl_res) {
+            !s->pm4_ring.remaining && !s->gl_res && !s->gl_defer_n) {
             s->engine_rptr_wb = 0;
             ati_r350_cp_rptr_writeback(s);
         }

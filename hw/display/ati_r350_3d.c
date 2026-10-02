@@ -6253,6 +6253,9 @@ void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
             ati_r350_gl_wait(s->gl_ctx);
             s->gl_dsyncs++;
             s->gl_res = false;
+            if (s->gl_async) {
+                ati_r350_gl_dmark_all(s);
+            }
             s->gl_dn = 0;
             s->gl_rel[why]++;
         }
@@ -6437,6 +6440,22 @@ static void r300_gl_dbind_range(ATIR350State *s, uint64_t lo, uint64_t hi)
 }
 
 /*
+ * A range the GPU has finished writing. The draw marked its rows dirty
+ * when it was encoded, but with fences trailing the GPU the display can
+ * refresh -- and take those bits -- before the pixels land, and then
+ * nothing would show them. Marking again once they have landed does.
+ */
+static void r300_gl_dmark(ATIR350State *s, unsigned k)
+{
+    uint64_t lo = s->gl_drng[k][0] & ~7ull;
+    uint64_t hi = (s->gl_drng[k][1] + 7) & ~7ull;
+
+    if (hi > lo && hi <= memory_region_size(&s->vram)) {
+        memory_region_set_dirty(&s->vram, lo, hi - lo);
+    }
+}
+
+/*
  * With fences trailing the GPU (ati_r350_defer()) the pending ranges are
  * no longer cleared by a wait at every ring end, so they would only grow;
  * a range whose last writer has completed is dropped instead.
@@ -6451,9 +6470,21 @@ void ati_r350_gl_prune(ATIR350State *s, uint64_t done)
             s->gl_drng[n][1] = s->gl_drng[k][1];
             s->gl_drng_ser[n] = s->gl_drng_ser[k];
             n++;
+        } else {
+            r300_gl_dmark(s, k);
         }
     }
     s->gl_dn = n;
+}
+
+/* every pending range, now landed: tell the display again */
+void ati_r350_gl_dmark_all(ATIR350State *s)
+{
+    unsigned k;
+
+    for (k = 0; k < s->gl_dn; k++) {
+        r300_gl_dmark(s, k);
+    }
 }
 
 static bool r300_gl_dbind(ATIR350State *s, const R300DrawState *d, bool z,
