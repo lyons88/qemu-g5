@@ -67,6 +67,11 @@
 #define ati_r350_gl_zfetch      r350_mtl_zfetch
 #define ati_r350_gl_vram        r350_mtl_vram
 #define ati_r350_gl_wait        r350_mtl_sync
+#define ati_r350_gl_commit      r350_mtl_commit
+#define ati_r350_gl_done        r350_mtl_done
+#define ati_r350_gl_next        r350_mtl_next
+#define ati_r350_gl_idle        r350_mtl_idle
+#define ati_r350_gl_notify      r350_mtl_notify
 #include "ati_r350_gpu.h"
 
 #import <Metal/Metal.h>
@@ -174,6 +179,10 @@ struct R350MtlCtx {
 
     uint64_t draws, cbs, passes;
     char desc[160];
+
+    /* called from Metal's own thread as each committed buffer completes */
+    void (*notify)(void *);
+    void *notify_op;
 };
 
 /*
@@ -1011,6 +1020,14 @@ static bool mtl_submit(R350MtlCtx *g, bool wait)
             [g->fl[g->fl_head].cb waitUntilCompleted];
             mtl_reap(g, false);
         }
+        if (g->notify) {
+            void (*fn)(void *) = g->notify;
+            void *op = g->notify_op;
+
+            [g->cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+                fn(op);
+            }];
+        }
         [g->cb commit];
         f = &g->fl[(g->fl_head + g->fl_n) % MTL_INFLIGHT];
         f->cb = g->cb;
@@ -1300,6 +1317,59 @@ bool ati_r350_gl_wait(R350MtlCtx *g)
         ok = mtl_submit(g, true);
     }
     return ok;
+}
+
+/* send what is drawn so far, without waiting; the serial that covers it */
+uint64_t ati_r350_gl_commit(R350MtlCtx *g)
+{
+    if (!g) {
+        return 0;
+    }
+    @autoreleasepool {
+        mtl_submit(g, false);
+    }
+    return g->serial;
+}
+
+/* the newest serial known complete */
+uint64_t ati_r350_gl_done(R350MtlCtx *g)
+{
+    if (!g) {
+        return 0;
+    }
+    @autoreleasepool {
+        mtl_reap(g, false);
+    }
+    return g->done;
+}
+
+/* the serial the next draw lands in: the open buffer's, or a new one's */
+uint64_t ati_r350_gl_next(R350MtlCtx *g)
+{
+    if (!g) {
+        return 0;
+    }
+    return g->cb ? g->serial : g->serial + 1;
+}
+
+/* nothing open, nothing running */
+bool ati_r350_gl_idle(R350MtlCtx *g)
+{
+    if (!g) {
+        return true;
+    }
+    @autoreleasepool {
+        mtl_reap(g, false);
+    }
+    return !g->cb && !g->fl_n;
+}
+
+void ati_r350_gl_notify(R350MtlCtx *g, void (*fn)(void *), void *opaque)
+{
+    if (g) {
+        g->notify = fn;
+        g->notify_op = opaque;
+    }
 }
 
 /* the pipeline for this request's fragment program, building on a miss */

@@ -320,6 +320,7 @@ struct ATIR350State {
     VMChangeStateEntry *engine_vmse;
     bool engine_busy;           /* atomic */
     bool engine_kick, engine_quit;
+    bool engine_gpu;            /* a GPU batch completed (engine_lock) */
     uint64_t engine_kicks, engine_waits, engine_wait_us, engine_bql_writes;
     uint64_t engine_ibs, engine_scratch;
     unsigned engine_rptr_wb;
@@ -729,7 +730,23 @@ struct ATIR350State {
      * waits for the GPU first; nothing is ever copied.
      */
     bool gl_direct;
+    /*
+     * Asynchronous fences (direct mode, gl-async=on): a scratch write or
+     * the end of a ring drain with GPU work outstanding is committed but
+     * not waited for; what it would have told the guest -- the scratch
+     * value, the read pointer -- is held here, in order, and published by
+     * the command processor thread once the GPU reports the work done.
+     */
+    bool gl_async;
+    struct {
+        uint64_t serial;
+        uint32_t val;
+        int n;                  /* scratch register, or -1: the read pointer */
+    } gl_defer[64];
+    unsigned gl_defer_h, gl_defer_n;
+    uint64_t gl_defer_fences, gl_defer_rings, gl_defer_full;
     uint64_t gl_drng[8][2];
+    uint64_t gl_drng_ser[8];    /* the GPU batch that last wrote each */
     unsigned gl_dn;
     uint64_t gl_dsyncs;
     bool gl_zres;
@@ -1012,6 +1029,10 @@ const char *ati_r350_gl_fb_name(ATIR350GlFallback why);
  * is resident, which is always the case with the default gl=off.
  */
 void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why);
+/* publish every held fence and read pointer: the GPU has gone idle */
+void ati_r350_defer_flush(ATIR350State *s);
+/* forget the pending ranges of every GPU batch up to `done` */
+void ati_r350_gl_prune(ATIR350State *s, uint64_t done);
 /* reset: give the target back and drop the decoded textures */
 void ati_r350_gl_reset(ATIR350State *s);
 void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len);

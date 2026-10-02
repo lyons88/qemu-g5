@@ -319,6 +319,20 @@ bool ati_r350_gl_depth(R350GlCtx *g);
 bool ati_r350_gl_direct(R350GlCtx *g);
 bool ati_r350_gl_vram(R350GlCtx *g, void *ptr, uint64_t size);
 bool ati_r350_gl_wait(R350GlCtx *g);
+/*
+ * ASYNCHRONOUS COMPLETION, direct backends only. commit() sends what has
+ * been drawn so far without waiting and returns the serial that covers
+ * it; done() is the newest serial known complete (every earlier one is
+ * too); idle() says nothing is open or running. notify() names a
+ * function the backend calls, from a thread of its own, each time a
+ * committed batch completes.
+ */
+uint64_t ati_r350_gl_commit(R350GlCtx *g);
+uint64_t ati_r350_gl_done(R350GlCtx *g);
+/* the serial the next draw will be part of */
+uint64_t ati_r350_gl_next(R350GlCtx *g);
+bool ati_r350_gl_idle(R350GlCtx *g);
+void ati_r350_gl_notify(R350GlCtx *g, void (*fn)(void *), void *opaque);
 bool ati_r350_gl_zseed(R350GlCtx *g, int x0, int y0, int w, int h,
                        const uint32_t *z);
 bool ati_r350_gl_zfetch(R350GlCtx *g, int x0, int y0, int w, int h,

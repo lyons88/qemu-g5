@@ -129,6 +129,55 @@ bool ati_r350_gl_wait(R350GlCtx *g)
     return true;
 }
 
+uint64_t ati_r350_gl_commit(R350GlCtx *g)
+{
+#ifdef CONFIG_DARWIN
+    if (g && g->api == R350_GPU_MTL) {
+        return r350_mtl_commit(g->mtl);
+    }
+#endif
+    return 0;
+}
+
+uint64_t ati_r350_gl_done(R350GlCtx *g)
+{
+#ifdef CONFIG_DARWIN
+    if (g && g->api == R350_GPU_MTL) {
+        return r350_mtl_done(g->mtl);
+    }
+#endif
+    return 0;
+}
+
+uint64_t ati_r350_gl_next(R350GlCtx *g)
+{
+#ifdef CONFIG_DARWIN
+    if (g && g->api == R350_GPU_MTL) {
+        return r350_mtl_next(g->mtl);
+    }
+#endif
+    return 0;
+}
+
+bool ati_r350_gl_idle(R350GlCtx *g)
+{
+#ifdef CONFIG_DARWIN
+    if (g && g->api == R350_GPU_MTL) {
+        return r350_mtl_idle(g->mtl);
+    }
+#endif
+    return true;
+}
+
+void ati_r350_gl_notify(R350GlCtx *g, void (*fn)(void *), void *opaque)
+{
+#ifdef CONFIG_DARWIN
+    if (g && g->api == R350_GPU_MTL) {
+        r350_mtl_notify(g->mtl, fn, opaque);
+    }
+#endif
+}
+
 bool ati_r350_gl_zseed(R350GlCtx *g, int x0, int y0, int w, int h,
                        const uint32_t *z)
 {

@@ -6256,6 +6256,8 @@ void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
             s->gl_dn = 0;
             s->gl_rel[why]++;
         }
+        /* everything has landed: what was held back can be told now */
+        ati_r350_defer_flush(s);
         return;
     }
     if (s->gl_lazy && s->gl_res) {
@@ -6333,6 +6335,15 @@ void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
             hit = off + (uint64_t)len > s->gl_drng[k][0] &&
                   off < s->gl_drng[k][1];
         }
+        if (hit && s->gl_async) {
+            /* the GPU may already be past it: ask before waiting */
+            ati_r350_gl_prune(s, ati_r350_gl_done(s->gl_ctx));
+            hit = false;
+            for (k = 0; k < s->gl_dn && !hit; k++) {
+                hit = off + (uint64_t)len > s->gl_drng[k][0] &&
+                      off < s->gl_drng[k][1];
+            }
+        }
     } else if (r300_gl_span(s, &lo, &hi) && off + len > lo && off < hi) {
         hit = true;
     }
@@ -6391,18 +6402,21 @@ static void r300_gl_dbind_range(ATIR350State *s, uint64_t lo, uint64_t hi)
     {
         unsigned k, best = 0;
         uint64_t gap = UINT64_MAX;
+        uint64_t ser = ati_r350_gl_next(s->gl_ctx);
 
         /* the same buffer again, or one touching it: grow that range */
         for (k = 0; k < s->gl_dn; k++) {
             if (lo <= s->gl_drng[k][1] && s->gl_drng[k][0] <= hi) {
                 s->gl_drng[k][0] = MIN(s->gl_drng[k][0], lo);
                 s->gl_drng[k][1] = MAX(s->gl_drng[k][1], hi);
+                s->gl_drng_ser[k] = ser;
                 return;
             }
         }
         if (s->gl_dn < ARRAY_SIZE(s->gl_drng)) {
             s->gl_drng[s->gl_dn][0] = lo;
             s->gl_drng[s->gl_dn][1] = hi;
+            s->gl_drng_ser[s->gl_dn] = ser;
             s->gl_dn++;
             return;
         }
@@ -6418,7 +6432,28 @@ static void r300_gl_dbind_range(ATIR350State *s, uint64_t lo, uint64_t hi)
         }
         s->gl_drng[best][0] = MIN(s->gl_drng[best][0], lo);
         s->gl_drng[best][1] = MAX(s->gl_drng[best][1], hi);
+        s->gl_drng_ser[best] = ser;
     }
+}
+
+/*
+ * With fences trailing the GPU (ati_r350_defer()) the pending ranges are
+ * no longer cleared by a wait at every ring end, so they would only grow;
+ * a range whose last writer has completed is dropped instead.
+ */
+void ati_r350_gl_prune(ATIR350State *s, uint64_t done)
+{
+    unsigned k, n = 0;
+
+    for (k = 0; k < s->gl_dn; k++) {
+        if (s->gl_drng_ser[k] > done) {
+            s->gl_drng[n][0] = s->gl_drng[k][0];
+            s->gl_drng[n][1] = s->gl_drng[k][1];
+            s->gl_drng_ser[n] = s->gl_drng_ser[k];
+            n++;
+        }
+    }
+    s->gl_dn = n;
 }
 
 static bool r300_gl_dbind(ATIR350State *s, const R300DrawState *d, bool z,

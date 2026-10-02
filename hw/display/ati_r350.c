@@ -1694,6 +1694,7 @@ static void ati_r350_bm_gui_run(ATIR350State *s, uint32_t table);
 static void ati_r350_pm4_run(ATIR350State *s);
 static void ati_r350_pm4_run_ring(ATIR350State *s);
 static void ati_r350_scratch_writeback(ATIR350State *s, unsigned n);
+static bool ati_r350_defer(ATIR350State *s, int n, uint32_t val);
 static void ati_r350_pm4_fifo_push(ATIR350State *s, uint32_t val);
 static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
                                      uint32_t dwords);
@@ -1848,6 +1849,19 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
          * that tells the driver its submitted work is done.
          */
         if (val & R350_SW_INT_FIRE) {
+            /*
+             * Raised from the command stream behind a fence that is
+             * still held back (ati_r350_defer()): it must not tell the
+             * driver its work is done before the fence says so.
+             */
+            if (ati_r350_on_engine() && s->gl_defer_n) {
+                if (ati_r350_defer(s, -2, 0)) {
+                    trace_ati_r350_int_ack(val, s->regs[base >> 2]);
+                    ati_r350_update_irq(s);
+                    break;
+                }
+                ati_r350_gl_release(s, R350_GLR_FENCE);
+            }
             s->regs[base >> 2] |= R350_SW_INT;
         }
         trace_ati_r350_int_ack(val, s->regs[base >> 2]);
@@ -2042,7 +2056,15 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_SCRATCH_REG_BASE ... R350_SCRATCH_REG_LAST:
         s->engine_scratch++;
         if (ati_r350_on_engine()) {
-            /* a fence: what was drawn before it is in VRAM first */
+            /*
+             * A fence: what was drawn before it is in VRAM first. With
+             * the GPU still busy that is published later, by the engine
+             * thread, once the GPU says so -- not waited for here.
+             */
+            if (ati_r350_defer(s, (base - R350_SCRATCH_REG_BASE) >> 2, val)) {
+                s->gl_defer_fences++;
+                break;
+            }
             ati_r350_gl_release(s, R350_GLR_FENCE);
         }
         qatomic_store_release(&s->regs[base >> 2], val);
@@ -2848,12 +2870,11 @@ static QEMUCursor *ati_r350_builtin_arrow(void)
  * BUF_SWAP: 1 = bytes in each half, 2 = whole dword, 3 = halves. The
  * Panther driver asks for 2 and reads the pointer with a plain load.
  */
-static void ati_r350_cp_rptr_writeback(ATIR350State *s)
+static void ati_r350_cp_rptr_write(ATIR350State *s, uint32_t val)
 {
     uint32_t cntl = s->regs[R350_CP_RB_CNTL >> 2];
     uint32_t reg = s->regs[R350_CP_RB_RPTR_ADDR >> 2];
     uint32_t addr = reg & ~R350_RB_RPTR_SWAP_MASK;
-    uint32_t val = s->pm4_rptr;
 
     if (!(cntl & R350_RB_NO_UPDATE) && addr) {
         switch (reg & R350_RB_RPTR_SWAP_MASK) {
@@ -2871,6 +2892,11 @@ static void ati_r350_cp_rptr_writeback(ATIR350State *s)
     }
 }
 
+static void ati_r350_cp_rptr_writeback(ATIR350State *s)
+{
+    ati_r350_cp_rptr_write(s, s->pm4_rptr);
+}
+
 static void ati_r350_scratch_writeback(ATIR350State *s, unsigned n)
 {
     uint32_t umsk = s->regs[R350_SCRATCH_UMSK >> 2];
@@ -2880,6 +2906,127 @@ static void ati_r350_scratch_writeback(ATIR350State *s, unsigned n)
         ati_r350_mc_write32(s, addr + n * 4,
                             s->regs[(R350_SCRATCH_REG_BASE >> 2) + n]);
     }
+}
+
+/*
+ * ASYNCHRONOUS FENCES. In zero-copy mode the draws write VRAM on the
+ * GPU, and the rule the strict model keeps -- the guest learns a fence
+ * has passed only once what came before it is in VRAM -- used to be kept
+ * by stopping the command processor until the GPU finished. Here it is
+ * kept by holding back what the guest would learn instead: the scratch
+ * value and the read pointer wait, in order, with the serial of the GPU
+ * batch that must complete first, and the command processor goes on
+ * parsing. The engine thread publishes them when Metal reports the batch
+ * done (ati_r350_engine_gpu_done() wakes it), and the engine counts as
+ * busy until it has -- so a guest that waits for idle still waits for
+ * the GPU.
+ */
+static bool ati_r350_defer(ATIR350State *s, int n, uint32_t val)
+{
+    unsigned k;
+
+    if (!s->gl_async || !s->gl_direct || !s->gl_res) {
+        return false;
+    }
+    if (n == -2 && !s->gl_defer_n) {
+        return false;           /* an interrupt with no fence to trail */
+    }
+    if (s->gl_defer_n == ARRAY_SIZE(s->gl_defer)) {
+        s->gl_defer_full++;
+        return false;           /* the caller waits, which publishes all */
+    }
+    k = (s->gl_defer_h + s->gl_defer_n) % ARRAY_SIZE(s->gl_defer);
+    s->gl_defer[k].serial = ati_r350_gl_commit(s->gl_ctx);
+    s->gl_defer[k].n = n;
+    s->gl_defer[k].val = val;
+    s->gl_defer_n++;
+    return true;
+}
+
+static void ati_r350_defer_pub(ATIR350State *s, unsigned k)
+{
+    int n = s->gl_defer[k].n;
+
+    if (n == -2) {
+        s->regs[R350_GEN_INT_STATUS >> 2] |= R350_SW_INT;
+        ati_r350_update_irq(s);
+        return;
+    }
+    if (n < 0) {
+        ati_r350_cp_rptr_write(s, s->gl_defer[k].val);
+        return;
+    }
+    qatomic_store_release(&s->regs[(R350_SCRATCH_REG_BASE >> 2) + n],
+                          s->gl_defer[k].val);
+    ati_r350_scratch_writeback(s, n);
+}
+
+/* publish what the GPU has caught up with; on the engine thread */
+static void ati_r350_defer_poll(ATIR350State *s)
+{
+    uint64_t done;
+
+    if (!s->gl_defer_n) {
+        return;
+    }
+    done = ati_r350_gl_done(s->gl_ctx);
+    if (s->gl_defer[s->gl_defer_h].serial <= done) {
+        /* the write-backs and the interrupt are the BQL's, as ever */
+        bool locked = bql_locked();
+
+        if (!locked) {
+            bql_lock();
+        }
+        while (s->gl_defer_n && s->gl_defer[s->gl_defer_h].serial <= done) {
+            ati_r350_defer_pub(s, s->gl_defer_h);
+            s->gl_defer_h = (s->gl_defer_h + 1) % ARRAY_SIZE(s->gl_defer);
+            s->gl_defer_n--;
+        }
+        if (!locked) {
+            bql_unlock();
+        }
+    }
+    ati_r350_gl_prune(s, done);
+    if (!s->gl_defer_n && s->gl_res && ati_r350_gl_idle(s->gl_ctx)) {
+        /* the GPU is idle: nothing of VRAM is pending any more */
+        s->gl_res = false;
+        s->gl_dn = 0;
+    }
+}
+
+void ati_r350_defer_flush(ATIR350State *s)
+{
+    bool locked;
+
+    if (!s->gl_defer_n) {
+        return;
+    }
+    locked = bql_locked();
+    if (!locked) {
+        bql_lock();
+    }
+    while (s->gl_defer_n) {
+        ati_r350_defer_pub(s, s->gl_defer_h);
+        s->gl_defer_h = (s->gl_defer_h + 1) % ARRAY_SIZE(s->gl_defer);
+        s->gl_defer_n--;
+    }
+    if (!locked) {
+        bql_unlock();
+    }
+}
+
+/* from Metal's completion thread: a batch finished */
+static void ati_r350_engine_gpu_done(void *opaque)
+{
+    ATIR350State *s = opaque;
+
+    if (!s->engine_on) {
+        return;
+    }
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_gpu = true;
+    qemu_cond_signal(&s->engine_cond);
+    qemu_mutex_unlock(&s->engine_lock);
 }
 
 static uint32_t ati_r350_pm4_read_ring(ATIR350State *s)
@@ -2912,6 +3059,14 @@ static void ati_r350_pm4_run(ATIR350State *s)
         return;
     }
     ati_r350_pm4_run_ring(s);
+    /*
+     * Asynchronous: the read pointer is held back with the fences, until
+     * the GPU has finished what was parsed -- see ati_r350_defer().
+     */
+    if (ati_r350_on_engine() && ati_r350_defer(s, -1, s->pm4_rptr)) {
+        s->gl_defer_rings++;
+        return;
+    }
     /*
      * A whole ring is drained inside the guest store that kicked it, so
      * this is the first moment the guest CPU could look at VRAM again --
@@ -3625,19 +3780,28 @@ static void *ati_r350_engine_thread(void *opaque)
     ati_r350_swap_memo_bind(&s->eswap);
     qemu_mutex_lock(&s->engine_lock);
     for (;;) {
-        while (!s->engine_kick && !s->engine_quit) {
+        bool kicked;
+
+        while (!s->engine_kick && !s->engine_quit && !s->engine_gpu) {
             qemu_cond_wait(&s->engine_cond, &s->engine_lock);
         }
         if (s->engine_quit) {
             break;
         }
+        kicked = s->engine_kick;
         s->engine_kick = false;
+        s->engine_gpu = false;
         qemu_mutex_unlock(&s->engine_lock);
 
-        ati_r350_pm4_run(s);
+        ati_r350_defer_poll(s);
+        if (kicked) {
+            ati_r350_pm4_run(s);
+            /* a batch that completed while parsing has no wake-up left */
+            ati_r350_defer_poll(s);
+        }
 
         qemu_mutex_lock(&s->engine_lock);
-        if (!s->engine_kick) {
+        if (!s->engine_kick && !s->gl_defer_n) {
             qatomic_store_release(&s->engine_busy, false);
             qemu_event_set(&s->engine_idle);
         }
@@ -4440,6 +4604,7 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                 return;
             }
             s->gl_direct = true;
+            ati_r350_gl_notify(s->gl_ctx, ati_r350_engine_gpu_done, s);
         }
         trace_ati_r350_gl_open(ati_r350_gl_describe(s->gl_ctx));
     }
@@ -4701,6 +4866,11 @@ static const Property ati_r350_properties[] = {
     DEFINE_PROP_STRING("gl", ATIR350State, gl_path),
     DEFINE_PROP_STRING("gl-api", ATIR350State, gl_api),
     DEFINE_PROP_STRING("gl-sync", ATIR350State, gl_sync),
+    /*
+     * gl-api=metal: let fences and the read pointer trail the GPU instead
+     * of stopping the command processor for it (see ati_r350_defer()).
+     */
+    DEFINE_PROP_BOOL("gl-async", ATIR350State, gl_async, true),
     /*
      * Diagnostic only (milestone M4): translate each vertex program the
      * guest uploads to GLSL and count whether the translator could
@@ -5072,6 +5242,13 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
             if (s->gl_direct) {
                 g_string_append_printf(out, "\nzero-copy: %" PRIu64
                                        " GPU waits", s->gl_dsyncs);
+                g_string_append_printf(out, "\nasync: %s, %" PRIu64
+                                       " fences and %" PRIu64
+                                       " ring ends deferred, %" PRIu64
+                                       " queue-full waits",
+                                       s->gl_async ? "on" : "off",
+                                       s->gl_defer_fences, s->gl_defer_rings,
+                                       s->gl_defer_full);
             }
             g_string_append_printf(out, "\ndepth buffer: %" PRIu64
                                    " flushes, %" PRIu64 " px out, %" PRIu64

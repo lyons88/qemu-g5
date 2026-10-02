@@ -58,6 +58,11 @@ bool r350_mtl_zfetch(R350MtlCtx *g, int x0, int y0, int w, int h,
 /* zero-copy: emulated VRAM as the backend's own buffer */
 bool r350_mtl_vram(R350MtlCtx *g, void *ptr, uint64_t size);
 bool r350_mtl_sync(R350MtlCtx *g);
+uint64_t r350_mtl_commit(R350MtlCtx *g);
+uint64_t r350_mtl_done(R350MtlCtx *g);
+uint64_t r350_mtl_next(R350MtlCtx *g);
+bool r350_mtl_idle(R350MtlCtx *g);
+void r350_mtl_notify(R350MtlCtx *g, void (*fn)(void *), void *opaque);
 #endif
 
 #endif /* ATI_R350_GPU_H */
