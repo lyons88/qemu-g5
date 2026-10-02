@@ -24,6 +24,7 @@
 #include "qemu/osdep.h"
 #include <math.h>
 #include <float.h>
+#include "qemu/host-utils.h"
 #include "ati_r350_pvs.h"
 
 static inline float r300_pvs_f32(uint32_t v)
@@ -539,25 +540,85 @@ static inline void r300_pvs_csrc(const R300PvsCSrc *o, const R300PvsRegs *r,
     }
 }
 
+/* note the register an operand reads, for the batched form */
+static void r300_pvs_cmark(R300PvsCompiled *cp, const R300PvsCSrc *o)
+{
+    switch (o->file) {
+    case 0:
+        cp->in_used |= 1u << o->idx;
+        break;
+    case 2:
+        cp->atmp_used |= 1u << o->idx;
+        break;
+    case 3:
+        cp->tmp_used |= 1u << o->idx;
+        break;
+    }
+}
+
 void r300_pvs_compile(const R300PvsProgram *p, R300PvsCompiled *cp)
 {
     unsigned i;
 
     cp->p = p;
     cp->n = 0;
+    cp->in_used = cp->tmp_used = cp->atmp_used = cp->out_used = 0;
     if (!p->valid) {
         return;
     }
     for (i = p->first; i <= p->last && cp->n < R300_PVS_CODE_SLOTS; i++) {
         const uint32_t *w = &p->code[i * 4];
         R300PvsCIns *in = &cp->ins[cp->n++];
+        uint32_t op = w[0];
+        bool math = op & R300_PVS_DST_MATH_INST;
 
+        memset(in, 0, sizeof(*in));
         in->w = w;
         r300_pvs_csrc_make(p, w[1], &in->a);
         r300_pvs_csrc_make(p, w[2], &in->b);
-        in->dual = (w[0] & R300_PVS_DST_DUAL_MATH_OP) != 0;
+        in->dual = (op & R300_PVS_DST_DUAL_MATH_OP) != 0;
         if (!in->dual) {
             r300_pvs_csrc_make(p, w[3], &in->c);
+            r300_pvs_cmark(cp, &in->c);
+        } else {
+            uint32_t dw = w[3];
+
+            in->dop = ((dw >> R300_PVS_DUAL_OPCODE_SHIFT) &
+                       R300_PVS_DUAL_OPCODE_MASK) |
+                      ((dw & R300_PVS_DUAL_OPCODE_MSB) ? 16 : 0);
+            in->ddoff = (dw >> R300_PVS_DUAL_DST_OFF_SHIFT) &
+                        R300_PVS_DUAL_DST_OFF_MASK;
+            in->dwe = (dw >> R300_PVS_DUAL_WE_SEL_SHIFT) &
+                      R300_PVS_DUAL_WE_SEL_MASK;
+            /* the operand exactly as r300_pvs_dual_math() reads it */
+            r300_pvs_csrc_make(p, dw & ~(0x3fu << 19), &in->d);
+            if (in->dop != R300_ME_NO_OP) {
+                r300_pvs_cmark(cp, &in->d);
+                cp->atmp_used |= 1u << in->ddoff;
+            }
+        }
+        r300_pvs_cmark(cp, &in->a);
+        r300_pvs_cmark(cp, &in->b);
+        in->opcode = op & R300_PVS_DST_OPCODE_MASK;
+        in->kind = (op & R300_PVS_DST_MACRO_INST) ? 2 : math ? 1 : 0;
+        in->sat = (op & (math ? R300_PVS_DST_ME_SAT :
+                         R300_PVS_DST_VE_SAT)) != 0;
+        in->dtype = (op >> R300_PVS_DST_REG_TYPE_SHIFT) &
+                    R300_PVS_DST_REG_TYPE_MASK;
+        in->doff = (op >> R300_PVS_DST_OFFSET_SHIFT) &
+                   R300_PVS_DST_OFFSET_MASK;
+        in->we = (op >> R300_PVS_DST_WE_SHIFT) & R300_PVS_DST_WE_MASK;
+        switch (in->dtype) {
+        case R300_PVS_DST_REG_OUT:
+        case R300_PVS_DST_REG_OUT_REPL_X:
+            cp->out_used |= 1u << (in->doff % R300_PVS_OUT_REGS);
+            break;
+        case R300_PVS_DST_REG_TEMPORARY:
+            cp->tmp_used |= 1u << (in->doff % R300_PVS_TMP_REGS);
+            break;
+        case R300_PVS_DST_REG_ALT_TEMP:
+            cp->atmp_used |= 1u << (in->doff % R300_PVS_ATMP_REGS);
+            break;
         }
     }
 }
@@ -577,6 +638,355 @@ void r300_pvs_exec(const R300PvsCompiled *cp, R300PvsRegs *r,
             r300_pvs_csrc(&in->c, r, c);
         }
         r300_pvs_ins(cp->p, r, gaps, in->w, a, b, c);
+    }
+}
+
+/*
+ * THE BATCHED FORM. Everything below mirrors r300_pvs_exec() and
+ * r300_pvs_ins() step for step -- the same checks in the same order, the
+ * same expressions written the same way so the compiler contracts them
+ * the same way -- with a loop over lanes where those have a single value.
+ */
+typedef float R300PvsLane[R300_PVS_LANES];
+
+void r300_pvs_soa_reset(const R300PvsCompiled *cp, R300PvsSoa *r)
+{
+    uint32_t m;
+
+    for (m = cp->tmp_used; m; m &= m - 1) {
+        memset(r->tmp[ctz32(m)], 0, sizeof(r->tmp[0]));
+    }
+    for (m = cp->atmp_used; m; m &= m - 1) {
+        memset(r->atmp[ctz32(m)], 0, sizeof(r->atmp[0]));
+    }
+    for (m = cp->out_used; m; m &= m - 1) {
+        memset(r->out[ctz32(m)], 0, sizeof(r->out[0]));
+    }
+    r->out_written = 0;
+}
+
+/*
+ * One operand over n lanes. A plain register is handed back in place
+ * when `alias` allows it -- i.e. when nothing will write the register
+ * before the instruction has consumed it -- and copied otherwise.
+ */
+static const R300PvsLane *r300_pvs_ssrc(const R300PvsCSrc *o,
+                                        const R300PvsSoa *r, unsigned n,
+                                        R300PvsLane *buf, bool alias)
+{
+    const R300PvsLane *v;
+    unsigned c, l;
+
+    switch (o->file) {
+    case 1:
+        for (c = 0; c < 4; c++) {
+            float k = o->kv[c];
+
+            for (l = 0; l < n; l++) {
+                buf[c][l] = k;
+            }
+        }
+        return buf;
+    case 0:
+        v = r->in[o->idx];
+        break;
+    case 2:
+        v = r->atmp[o->idx];
+        break;
+    default:
+        v = r->tmp[o->idx];
+        break;
+    }
+    if (o->plain) {
+        if (alias) {
+            return v;
+        }
+        for (c = 0; c < 4; c++) {
+            memcpy(buf[c], v[c], n * sizeof(float));
+        }
+        return buf;
+    }
+    for (c = 0; c < 4; c++) {
+        unsigned sel = o->sel[c];
+        bool neg = (o->neg >> c) & 1;
+
+        if (sel >= 4) {
+            float f = sel == R300_PVS_SRC_SELECT_FORCE_1 ? 1.0f : 0.0f;
+
+            if (o->abs) {
+                f = fabsf(f);
+            }
+            if (neg) {
+                f = -f;
+            }
+            for (l = 0; l < n; l++) {
+                buf[c][l] = f;
+            }
+            continue;
+        }
+        {
+            const float *src = v[sel];
+
+            if (o->abs && neg) {
+                for (l = 0; l < n; l++) {
+                    buf[c][l] = -fabsf(src[l]);
+                }
+            } else if (o->abs) {
+                for (l = 0; l < n; l++) {
+                    buf[c][l] = fabsf(src[l]);
+                }
+            } else if (neg) {
+                for (l = 0; l < n; l++) {
+                    buf[c][l] = -src[l];
+                }
+            } else {
+                memcpy(buf[c], src, n * sizeof(float));
+            }
+        }
+    }
+    return buf;
+}
+
+static void r300_pvs_note_math(R300PvsGaps *gaps, unsigned opcode)
+{
+    if (gaps && !gaps->has_math_op) {
+        gaps->has_math_op = true;
+        gaps->math_op = opcode;
+    }
+}
+
+/* the vector engine over n lanes; false for an opcode it does not know */
+static bool r300_pvs_svector(unsigned opcode, const R300PvsLane *a,
+                             const R300PvsLane *b, const R300PvsLane *c,
+                             R300PvsLane *res, unsigned n)
+{
+    unsigned i, l;
+
+    switch (opcode) {
+    case R300_VE_DOT_PRODUCT:
+        for (l = 0; l < n; l++) {
+            float t = a[0][l] * b[0][l] + a[1][l] * b[1][l] +
+                      a[2][l] * b[2][l] + a[3][l] * b[3][l];
+
+            res[0][l] = t;
+            res[1][l] = t;
+            res[2][l] = t;
+            res[3][l] = t;
+        }
+        return true;
+    case R300_VE_MULTIPLY:
+        for (i = 0; i < 4; i++) {
+            for (l = 0; l < n; l++) {
+                res[i][l] = a[i][l] * b[i][l];
+            }
+        }
+        return true;
+    case R300_VE_ADD:
+        for (i = 0; i < 4; i++) {
+            for (l = 0; l < n; l++) {
+                res[i][l] = a[i][l] + b[i][l];
+            }
+        }
+        return true;
+    case R300_VE_MULTIPLY_ADD:
+        for (i = 0; i < 4; i++) {
+            for (l = 0; l < n; l++) {
+                res[i][l] = a[i][l] * b[i][l] + c[i][l];
+            }
+        }
+        return true;
+    case R300_VE_MULTIPLYX2_ADD:
+        for (i = 0; i < 4; i++) {
+            for (l = 0; l < n; l++) {
+                res[i][l] = 2.0f * (a[i][l] * b[i][l]) + c[i][l];
+            }
+        }
+        return true;
+    case R300_VE_DISTANCE_VECTOR:
+        for (l = 0; l < n; l++) {
+            res[0][l] = 1.0f;
+            res[1][l] = a[1][l] * b[1][l];
+            res[2][l] = a[2][l];
+            res[3][l] = b[3][l];
+        }
+        return true;
+    case R300_VE_FRACTION:
+        for (i = 0; i < 4; i++) {
+            for (l = 0; l < n; l++) {
+                res[i][l] = a[i][l] - floorf(a[i][l]);
+            }
+        }
+        return true;
+    case R300_VE_MAXIMUM:
+        for (i = 0; i < 4; i++) {
+            for (l = 0; l < n; l++) {
+                res[i][l] = MAX(a[i][l], b[i][l]);
+            }
+        }
+        return true;
+    case R300_VE_MINIMUM:
+        for (i = 0; i < 4; i++) {
+            for (l = 0; l < n; l++) {
+                res[i][l] = MIN(a[i][l], b[i][l]);
+            }
+        }
+        return true;
+    case R300_VE_SET_GREATER_THAN_EQUAL:
+        for (i = 0; i < 4; i++) {
+            for (l = 0; l < n; l++) {
+                res[i][l] = a[i][l] >= b[i][l] ? 1.0f : 0.0f;
+            }
+        }
+        return true;
+    case R300_VE_SET_LESS_THAN:
+        for (i = 0; i < 4; i++) {
+            for (l = 0; l < n; l++) {
+                res[i][l] = a[i][l] < b[i][l] ? 1.0f : 0.0f;
+            }
+        }
+        return true;
+    case R300_VE_MULTIPLY_CLAMP:
+        for (l = 0; l < n; l++) {
+            float t;
+
+            if (c[3][l] < a[3][l] * b[3][l]) {
+                t = c[3][l];
+            } else if (c[0][l] >= a[0][l] * b[0][l]) {
+                t = c[0][l];
+            } else {
+                t = a[0][l] * b[0][l];
+            }
+            res[0][l] = t;
+            res[1][l] = t;
+            res[2][l] = t;
+            res[3][l] = t;
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+void r300_pvs_exec_soa(const R300PvsCompiled *cp, R300PvsSoa *r, unsigned n,
+                       R300PvsGaps *gaps)
+{
+    static const R300PvsLane zero[4];
+    R300PvsLane A[4], B[4], C[4], D[4], R[4];
+    unsigned i, k, l;
+
+    if (n > R300_PVS_LANES) {
+        n = R300_PVS_LANES;
+    }
+    for (i = 0; i < cp->n; i++) {
+        const R300PvsCIns *in = &cp->ins[i];
+        const R300PvsLane *a, *b, *c;
+        R300PvsLane *dst;
+
+        /*
+         * The operands are read before the dual-issue half writes the
+         * alternate temporaries, as the scalar form copies them first:
+         * one in that file is copied here too.
+         */
+        a = r300_pvs_ssrc(&in->a, r, n, A, !(in->dual && in->a.file == 2));
+        b = r300_pvs_ssrc(&in->b, r, n, B, !(in->dual && in->b.file == 2));
+        c = in->dual ? zero : r300_pvs_ssrc(&in->c, r, n, C, true);
+
+        if (in->dual && in->dop != R300_ME_NO_OP) {
+            float fa[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            float fb[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            float res[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            const R300PvsLane *d = r300_pvs_ssrc(&in->d, r, n, D, false);
+
+            if (!r300_pvs_math(in->dop, fa, fb, fb, res)) {
+                r300_pvs_note_math(gaps, in->dop);
+            } else {
+                for (l = 0; l < n; l++) {
+                    fa[3] = d[0][l];
+                    fb[3] = d[1][l];
+                    r300_pvs_math(in->dop, fa, fb, fb, res);
+                    r->atmp[in->ddoff][in->dwe][l] = res[in->dwe];
+                }
+            }
+        }
+
+        if (in->kind == 2) {
+            float m = in->opcode ? 2.0f : 1.0f;
+
+            for (k = 0; k < 4; k++) {
+                for (l = 0; l < n; l++) {
+                    R[k][l] = a[k][l] * b[k][l] * m + c[k][l];
+                }
+            }
+        } else if (in->kind == 1) {
+            float fa[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            float fb[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            float fc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            float res[4];
+
+            if (in->opcode == R300_ME_NO_OP) {
+                continue;
+            }
+            if (!r300_pvs_math(in->opcode, fa, fb, fc, res)) {
+                r300_pvs_note_math(gaps, in->opcode);
+                continue;
+            }
+            for (l = 0; l < n; l++) {
+                fa[3] = a[3][l];
+                fb[3] = b[3][l];
+                fc[3] = c[3][l];
+                r300_pvs_math(in->opcode, fa, fb, fc, res);
+                R[0][l] = res[0];
+                R[1][l] = res[1];
+                R[2][l] = res[2];
+                R[3][l] = res[3];
+            }
+        } else {
+            if (in->opcode == R300_VE_NO_OP) {
+                continue;
+            }
+            if (!r300_pvs_svector(in->opcode, a, b, c, R, n)) {
+                if (gaps && !gaps->has_vec_op) {
+                    gaps->has_vec_op = true;
+                    gaps->vec_op = in->opcode;
+                }
+                continue;
+            }
+        }
+
+        if (in->sat) {
+            for (k = 0; k < 4; k++) {
+                for (l = 0; l < n; l++) {
+                    R[k][l] = MIN(MAX(R[k][l], 0.0f), 1.0f);
+                }
+            }
+        }
+
+        switch (in->dtype) {
+        case R300_PVS_DST_REG_OUT:
+        case R300_PVS_DST_REG_OUT_REPL_X:
+            dst = r->out[in->doff % R300_PVS_OUT_REGS];
+            r->out_written |= 1u << (in->doff % R300_PVS_OUT_REGS);
+            break;
+        case R300_PVS_DST_REG_TEMPORARY:
+            dst = r->tmp[in->doff % R300_PVS_TMP_REGS];
+            break;
+        case R300_PVS_DST_REG_ALT_TEMP:
+            dst = r->atmp[in->doff % R300_PVS_ATMP_REGS];
+            break;
+        default:
+            if (gaps && !gaps->has_dst_file) {
+                gaps->has_dst_file = true;
+                gaps->dst_file = in->dtype;
+            }
+            continue;
+        }
+        for (k = 0; k < 4; k++) {
+            if (in->we & (1u << k)) {
+                memcpy(dst[k],
+                       R[in->dtype == R300_PVS_DST_REG_OUT_REPL_X ? 0 : k],
+                       n * sizeof(float));
+            }
+        }
     }
 }
 

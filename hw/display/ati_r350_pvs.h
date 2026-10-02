@@ -240,17 +240,52 @@ typedef struct R300PvsCIns {
     const uint32_t *w;          /* the instruction's four dwords */
     bool dual;
     R300PvsCSrc a, b, c;
+    /* decoded once for the batched form */
+    R300PvsCSrc d;              /* the dual-issue math operand */
+    uint8_t opcode, dtype, doff, we, sat;
+    uint8_t kind;               /* 0 vector, 1 math, 2 macro */
+    uint8_t dop, ddoff, dwe;    /* the dual-issue math half */
 } R300PvsCIns;
 
 typedef struct R300PvsCompiled {
     const R300PvsProgram *p;
     unsigned n;
+    /* registers the program touches at all, for the batched form */
+    uint32_t in_used, tmp_used, atmp_used, out_used;
     R300PvsCIns ins[R300_PVS_CODE_SLOTS];
 } R300PvsCompiled;
 
 void r300_pvs_compile(const R300PvsProgram *p, R300PvsCompiled *cp);
 void r300_pvs_exec(const R300PvsCompiled *cp, R300PvsRegs *r,
                    R300PvsGaps *gaps);
+
+/*
+ * THE BATCHED FORM: one compiled program over up to R300_PVS_LANES
+ * vertices at once, each register stored channel by channel with a lane
+ * per vertex. The interpreter's per-instruction work -- dispatch, operand
+ * decode, swizzle -- is then paid once per batch instead of once per
+ * vertex, and the arithmetic is plain loops over lanes that the compiler
+ * turns into SIMD. Bit-identical to r300_pvs_exec() on every lane: the
+ * same expressions in the same order, and the math engine is the very
+ * same function.
+ *
+ * The caller fills in[] for every register in cp->in_used and calls
+ * r300_pvs_soa_reset() first; out_written then says, as for the scalar
+ * form, which outputs the program wrote (the same for every lane).
+ */
+#define R300_PVS_LANES 32
+
+typedef struct R300PvsSoa {
+    float in[R300_PVS_IN_REGS][4][R300_PVS_LANES];
+    float tmp[R300_PVS_TMP_REGS][4][R300_PVS_LANES];
+    float atmp[R300_PVS_ATMP_REGS][4][R300_PVS_LANES];
+    float out[R300_PVS_OUT_REGS][4][R300_PVS_LANES];
+    uint32_t out_written;
+} R300PvsSoa;
+
+void r300_pvs_soa_reset(const R300PvsCompiled *cp, R300PvsSoa *r);
+void r300_pvs_exec_soa(const R300PvsCompiled *cp, R300PvsSoa *r, unsigned n,
+                       R300PvsGaps *gaps);
 
 /* one constant vector as the program addresses it, cmax applied */
 void r300_pvs_const(const R300PvsProgram *p, unsigned off, float v[4]);

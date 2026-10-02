@@ -25,6 +25,7 @@
 #include "qemu/rcu.h"
 #include "qemu/thread.h"
 #include "qemu/units.h"
+#include "qemu/host-utils.h"
 #include "exec/target_page.h"
 #include "ati_r350_int.h"
 #include "ati_r350_regs.h"
@@ -3270,6 +3271,51 @@ static void r300_vs_color1(R300Vtx *v, const float c[4])
 }
 
 /*
+ * What the vertex stage keeps of a program's outputs: the colours, the
+ * computed texture coordinates, and the clip-space position (true when
+ * there is one). Shared by the per-vertex and the batched forms.
+ */
+static bool r300_vs_finish(const R300DrawState *d, R300Vtx *v, uint32_t ow,
+                           float (*out)[4], float clip[4])
+{
+    unsigned a;
+
+    if ((ow & (1u << d->vs_color_out)) && r300_vs_has_color(d)) {
+        r300_vs_color(v, out[d->vs_color_out]);
+    }
+    if (d->vs_color2 && (ow & (1u << d->vs_color2_out))) {
+        r300_vs_color1(v, out[d->vs_color2_out]);
+    }
+    for (a = 0; a < d->ntc; a++) {
+        if (d->vs_texcoord[a] && (ow & (1u << d->vs_tex_out[a]))) {
+            r300_vs_texcoord(d, v, a, out[d->vs_tex_out[a]]);
+        }
+    }
+    if (!(ow & 1)) {
+        /*
+         * A program that never wrote the position leaves nothing to
+         * transform; the matrix is a better answer than out[0]'s zeroes.
+         */
+        return false;
+    }
+    memcpy(clip, out[0], 4 * sizeof(float));
+    return true;
+}
+
+static void r300_vs_gaps(ATIR350State *s, const R300PvsGaps *g)
+{
+    if (g->has_vec_op) {
+        ati_r350_note_gap(s, R350_GAP_VS_VECTOR_OP, g->vec_op);
+    }
+    if (g->has_math_op) {
+        ati_r350_note_gap(s, R350_GAP_VS_MATH_OP, g->math_op);
+    }
+    if (g->has_dst_file) {
+        ati_r350_note_gap(s, R350_GAP_VS_DST_FILE, g->dst_file);
+    }
+}
+
+/*
  * Run the vertex program for this vertex, as far as this model consumes
  * it: the clip-space position, and the colour the rasterizer interpolates.
  *
@@ -3324,37 +3370,8 @@ static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
     } else {
         r300_pvs_run(&d->vs, &r, &g);
     }
-    if (g.has_vec_op) {
-        ati_r350_note_gap(s, R350_GAP_VS_VECTOR_OP, g.vec_op);
-    }
-    if (g.has_math_op) {
-        ati_r350_note_gap(s, R350_GAP_VS_MATH_OP, g.math_op);
-    }
-    if (g.has_dst_file) {
-        ati_r350_note_gap(s, R350_GAP_VS_DST_FILE, g.dst_file);
-    }
-
-    if ((r.out_written & (1u << d->vs_color_out)) && r300_vs_has_color(d)) {
-        r300_vs_color(v, r.out[d->vs_color_out]);
-    }
-    if (d->vs_color2 && (r.out_written & (1u << d->vs_color2_out))) {
-        r300_vs_color1(v, r.out[d->vs_color2_out]);
-    }
-    for (a = 0; a < d->ntc; a++) {
-        if (d->vs_texcoord[a] &&
-            (r.out_written & (1u << d->vs_tex_out[a]))) {
-            r300_vs_texcoord(d, v, a, r.out[d->vs_tex_out[a]]);
-        }
-    }
-    if (!(r.out_written & 1)) {
-        /*
-         * A program that never wrote the position leaves nothing to
-         * transform; the matrix is a better answer than out[0]'s zeroes.
-         */
-        return false;
-    }
-    memcpy(clip, r.out[0], sizeof(r.out[0]));
-    return true;
+    r300_vs_gaps(s, &g);
+    return r300_vs_finish(d, v, r.out_written, r.out, clip);
 }
 
 /*
@@ -8219,8 +8236,9 @@ typedef struct R300AosCtx {
     R300Vtx *out;               /* indexed by vertex index */
 } R300AosCtx;
 
-static void r300_aos_one(const R300AosCtx *cx, unsigned vi, R300Vtx *v,
-                         bool first, uint32_t *dw)
+/* fetch and unpack one vertex: everything short of the vertex program */
+static void r300_aos_load(const R300AosCtx *cx, unsigned vi, R300Vtx *v,
+                          bool first, uint32_t *dw)
 {
     ATIR350State *s = cx->s;
     R300DrawState *d = cx->d;
@@ -8280,6 +8298,15 @@ static void r300_aos_one(const R300AosCtx *cx, unsigned vi, R300Vtx *v,
     if (first && d->textured) {
         r300_trace_texcoord(d, cx->fmt, dw, v);
     }
+}
+
+static void r300_aos_one(const R300AosCtx *cx, unsigned vi, R300Vtx *v,
+                         bool first, uint32_t *dw)
+{
+    ATIR350State *s = cx->s;
+    R300DrawState *d = cx->d;
+
+    r300_aos_load(cx, vi, v, first, dw);
     if (d->vs_run) {
         float clip[4];
 
@@ -8291,12 +8318,85 @@ static void r300_aos_one(const R300AosCtx *cx, unsigned vi, R300Vtx *v,
     r300_xform_vtx(s, d, v, NULL);
 }
 
+/*
+ * The batched vertex stage: up to R300_PVS_LANES vertices fetched, then
+ * the program run over all of them at once (r300_pvs_exec_soa), then
+ * each finished exactly as r300_vs_vtx() finishes one. Same results to
+ * the bit as running r300_aos_one() per vertex; the interpreter's
+ * per-instruction overhead is paid once per batch.
+ */
+static void r300_aos_batch(const R300AosCtx *cx, unsigned k0, unsigned k1)
+{
+    ATIR350State *s = cx->s;
+    R300DrawState *d = cx->d;
+    const R300PvsCompiled *cp = d->vsc;
+    /* 35 KiB: kept per thread rather than on a 512 KiB thread stack */
+    static __thread R300PvsSoa *soa_tls;
+    R300PvsSoa *soa;
+    uint32_t dw[R300_VTX_DWORDS_MAX];
+    unsigned k;
+
+    if (!soa_tls) {
+        soa_tls = g_new(R300PvsSoa, 1);
+    }
+    soa = soa_tls;
+    for (k = k0; k < k1; k += R300_PVS_LANES) {
+        unsigned n = MIN(R300_PVS_LANES, k1 - k), l;
+        R300PvsGaps g;
+        uint32_t m;
+
+        r300_pvs_soa_reset(cp, soa);
+        for (l = 0; l < n; l++) {
+            unsigned vi = cx->list ? cx->list[k + l] : cx->base + k + l;
+
+            r300_aos_load(cx, vi, &cx->out[vi], false, dw);
+            for (m = cp->in_used; m; m &= m - 1) {
+                unsigned a = ctz32(m);
+                float in[4];
+
+                r300_vs_input(d, cx->fmt, dw, a, in);
+                soa->in[a][0][l] = in[0];
+                soa->in[a][1][l] = in[1];
+                soa->in[a][2][l] = in[2];
+                soa->in[a][3][l] = in[3];
+            }
+        }
+        memset(&g, 0, sizeof(g));
+        r300_pvs_exec_soa(cp, soa, n, &g);
+        r300_vs_gaps(s, &g);
+        for (l = 0; l < n; l++) {
+            unsigned vi = cx->list ? cx->list[k + l] : cx->base + k + l;
+            R300Vtx *v = &cx->out[vi];
+            float out[R300_PVS_OUT_REGS][4];
+            float clip[4];
+
+            for (m = soa->out_written; m; m &= m - 1) {
+                unsigned o = ctz32(m);
+
+                out[o][0] = soa->out[o][0][l];
+                out[o][1] = soa->out[o][1][l];
+                out[o][2] = soa->out[o][2][l];
+                out[o][3] = soa->out[o][3][l];
+            }
+            if (r300_vs_finish(d, v, soa->out_written, out, clip)) {
+                r300_xform_vtx(s, d, v, clip);
+            } else {
+                r300_xform_vtx(s, d, v, NULL);
+            }
+        }
+    }
+}
+
 static void r300_aos_range(void *opaque, unsigned k0, unsigned k1)
 {
     const R300AosCtx *cx = opaque;
     uint32_t dw[R300_VTX_DWORDS_MAX];
     unsigned k;
 
+    if (cx->d->vs_run && cx->d->vsc && !cx->d->vs.plain_matrix) {
+        r300_aos_batch(cx, k0, k1);
+        return;
+    }
     for (k = k0; k < k1; k++) {
         unsigned vi = cx->list ? cx->list[k] : cx->base + k;
 
