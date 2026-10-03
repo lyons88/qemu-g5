@@ -1778,6 +1778,23 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         return;
     }
     ati_r350_audit_reg_write(s, base);
+    if (s->rt_path && !s->rt_done) {
+        if (!s->rt_armed) {
+            uint32_t h = s->regs[R350_CRTC_H_TOTAL_DISP >> 2];
+            uint32_t w = (((h >> R350_CRTC_H_DISP_SHIFT) &
+                           R350_CRTC_H_DISP_MASK) + 1) * 8;
+
+            if (s->rt_width && w == s->rt_width) {
+                s->rt_armed = true;
+                ati_r350_rt_printf(s, "# armed: CRTC is %u wide\n", w);
+            }
+        }
+        if (ati_r350_rt_on(s)) {
+            ati_r350_rt_printf(s, "W %04x %-28s %08x%s\n", base,
+                               ati_r350_reg_name(base), val,
+                               ati_r350_on_engine() ? "" : " mmio");
+        }
+    }
 
     /*
      * Diagnostic: the 2D source/destination context. Mac OS X programs
@@ -2055,6 +2072,38 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         s->regs[base >> 2] = val;
         trace_ati_r350_cp_reg(ati_r350_reg_name(base), val);
         break;
+    /*
+     * OCCLUSION QUERIES, as the R300 driver issues them (Mesa
+     * r300_query.c does the same): ZB_ZPASS_DATA = 0 resets the
+     * counter, the query's draws run, then per pipe SU_REG_DEST selects
+     * the pipe and a ZB_ZPASS_ADDR write makes the GPU store that pipe's
+     * count, one dword, at that card address. The guest then waits for
+     * the dword. Nothing stored it: Halo hung on its first query (its
+     * lens-flare visibility test), forever, after the menu.
+     *
+     * This model has one pipe's worth of counting: pipe 0 reports the
+     * whole count, every other pipe 0, so the sum the driver forms is
+     * right.
+     */
+    case 0x4f58:        /* ZB_ZPASS_DATA */
+        s->regs[base >> 2] = val;
+        qatomic_set(&s->zpass_count, val);
+        s->zq_active = true;
+        break;
+    case 0x4f5c: {      /* ZB_ZPASS_ADDR */
+        uint32_t dest = s->regs[0x42c8 >> 2] & 0xf;   /* SU_REG_DEST */
+
+        s->regs[base >> 2] = val;
+        ati_r350_mc_write32(s, val & ~3u,
+                            (dest & 1) ? qatomic_read(&s->zpass_count) : 0);
+        s->zq_active = false;
+        if (ati_r350_rt_on(s)) {
+            ati_r350_rt_printf(s, "# zpass dump pipe-mask %x -> %08x: %u\n",
+                               dest, val, (dest & 1) ?
+                               qatomic_read(&s->zpass_count) : 0);
+        }
+        break;
+    }
     case R350_SCRATCH_REG_BASE ... R350_SCRATCH_REG_LAST:
         s->engine_scratch++;
         if (ati_r350_on_engine()) {
@@ -3170,6 +3219,10 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             p->p3_param_idx = 0;
             p->p3_total = p->remaining;
             trace_ati_r350_pm4_p3_hdr(p->p3_opcode, p->remaining);
+            if (ati_r350_rt_on(s)) {
+                ati_r350_rt_printf(s, "P3 op=0x%02x count=%u\n",
+                                   p->p3_opcode, p->remaining);
+            }
             if (p->p3_opcode != R350_PM4_OPCODE_PAINT &&
                 p->p3_opcode != R350_PM4_OPCODE_PAINT_MULTI &&
                 p->p3_opcode != R350_PM4_OPCODE_BITBLT &&
@@ -3819,7 +3872,6 @@ static void *ati_r350_engine_thread(void *opaque)
             /* a batch that completed while parsing has no wake-up left */
             ati_r350_defer_poll(s);
         }
-
         qemu_mutex_lock(&s->engine_lock);
         if (!s->engine_kick && !s->gl_defer_n) {
             qatomic_store_release(&s->engine_busy, false);
@@ -3884,6 +3936,37 @@ static uint64_t ati_r350_mmio_read(void *opaque, hwaddr addr,
     }
     val = ati_r350_reg_read32(s, base);
     val = extract32(val, (addr & 3) * 8, size * 8);
+    /*
+     * regtrace: the guest's MMIO READS too, so a program spinning on a
+     * register (a hang) shows as what it polls and what it keeps
+     * getting. A run of identical reads is folded: printed at 1, 2, 4
+     * ... 65536 repeats, every 65536 after, and once more when the run
+     * ends.
+     */
+    if (ati_r350_rt_on(s)) {
+        if (base == s->rt_rd_addr && val == s->rt_rd_val) {
+            uint64_t n = ++s->rt_rd_n;
+
+            if ((n <= 65536 && !(n & (n - 1))) || !(n % 65536)) {
+                ati_r350_rt_printf(s, "R %04x %-28s %08x x%" PRIu64 "\n",
+                                   base, ati_r350_reg_name(base), val, n);
+                s->rt_rd_shown = n;
+            }
+        } else {
+            if (s->rt_rd_n > s->rt_rd_shown) {
+                ati_r350_rt_printf(s, "R %04x %-28s %08x x%" PRIu64 "\n",
+                                   s->rt_rd_addr,
+                                   ati_r350_reg_name(s->rt_rd_addr),
+                                   s->rt_rd_val, s->rt_rd_n);
+            }
+            s->rt_rd_addr = base;
+            s->rt_rd_val = val;
+            s->rt_rd_n = 1;
+            s->rt_rd_shown = 1;
+            ati_r350_rt_printf(s, "R %04x %-28s %08x\n", base,
+                               ati_r350_reg_name(base), val);
+        }
+    }
     if (trace_event_get_state_backends(TRACE_ATI_R350_UNK_READ) ||
         trace_event_get_state_backends(TRACE_ATI_R350_REG_READ)) {
         if (ati_r350_reg_name(base)[0] == '?') {
@@ -4489,6 +4572,24 @@ static void ati_r350_agp_attach(ATIR350State *s)
     }
 }
 
+static char *ati_r350_get_gl(Object *obj, Error **errp);
+
+/* stats-log: gl-stats appended to a file every 10 s, no monitor needed */
+static void ati_r350_stats_tick(void *opaque)
+{
+    ATIR350State *s = opaque;
+    g_autofree char *st = ati_r350_get_gl(OBJECT(s), NULL);
+    FILE *f = fopen(s->stats_log, "a");
+
+    if (f) {
+        fprintf(f, "==== %" PRId64 " s\n%s\n",
+                (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - s->stats_t0) / 1000,
+                st);
+        fclose(f);
+    }
+    timer_mod(s->stats_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10000);
+}
+
 static void ati_r350_realize(PCIDevice *dev, Error **errp)
 {
     ATIR350State *s = ATI_R350(dev);
@@ -4496,6 +4597,12 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
 
     s->con = qemu_graphic_console_create(DEVICE(dev), 0,
                                          &ati_r350_gfx_ops, s);
+    if (s->stats_log && s->stats_log[0]) {
+        s->stats_t0 = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        s->stats_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                      ati_r350_stats_tick, s);
+        timer_mod(s->stats_timer, s->stats_t0 + 10000);
+    }
 
     /*
      * BAR0: the 128MB linear frame-buffer aperture, all of it VRAM. The
@@ -4803,6 +4910,10 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
 
 static void ati_r350_exit(PCIDevice *dev)
 {
+    if (ATI_R350(dev)->rt_fp) {
+        fclose(ATI_R350(dev)->rt_fp);
+        ATI_R350(dev)->rt_fp = NULL;
+    }
     ATIR350State *s = ATI_R350(dev);
     unsigned i;
 
@@ -4825,7 +4936,11 @@ static void ati_r350_exit(PCIDevice *dev)
     g_free(s->gl_before);
     g_free(s->gl_out);
     g_free(s->gl_sw);
-    g_free(s->gl_texbuf);
+    for (unsigned tb = 0; tb < ARRAY_SIZE(s->gl_texbuf); tb++) {
+        g_free(s->gl_texbuf[tb]);
+        s->gl_texbuf[tb] = NULL;
+        s->gl_texbuf_sz[tb] = 0;
+    }
     g_free(s->gl_verts);
     g_free(s->gl_zstage);
     g_free(s->pvs_cc);
@@ -4876,6 +4991,12 @@ static const Property ati_r350_properties[] = {
      * never runs.
      */
     DEFINE_PROP_STRING("draw-capture", ATIR350State, cap_path),
+    DEFINE_PROP_STRING("regtrace", ATIR350State, rt_path),
+    DEFINE_PROP_STRING("us-dump", ATIR350State, us_dump_path),
+    DEFINE_PROP_STRING("stats-log", ATIR350State, stats_log),
+    DEFINE_PROP_UINT32("regtrace-width", ATIR350State, rt_width, 640),
+    DEFINE_PROP_UINT32("regtrace-mb", ATIR350State, rt_mb, 400),
+    DEFINE_PROP_BOOL("regtrace-tail", ATIR350State, rt_tail, false),
     DEFINE_PROP_UINT32("draw-capture-max", ATIR350State, cap_max, 256),
     DEFINE_PROP_UINT32("draw-capture-max-px", ATIR350State, cap_max_px,
                        256 * 256),
@@ -4890,7 +5011,7 @@ static const Property ati_r350_properties[] = {
      * gl-api=metal: let fences and the read pointer trail the GPU instead
      * of stopping the command processor for it (see ati_r350_defer()).
      */
-    DEFINE_PROP_BOOL("gl-async", ATIR350State, gl_async, true),
+    DEFINE_PROP_BOOL("gl-async", ATIR350State, gl_async, false),
     /*
      * Diagnostic only (milestone M4): translate each vertex program the
      * guest uploads to GLSL and count whether the translator could
@@ -5207,6 +5328,25 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                              ? "never (CONTROL: invalidation OFF)" : "dirty",
                            s->gl_tex_noadmit, s->gl_tex_stale,
                            s->gl_tex_wrote, s->gl_tex_over, s->gl_tex_evict);
+    g_string_append_printf(out, "\n  bus (AGP/PCI) textures: %" PRIu64
+                           " hits, %" PRIu64 " decodes",
+                           s->gl_btex_hit, s->gl_btex_miss);
+    g_string_append_printf(out, "\ndestination rect refusals: %" PRIu64
+                           " off-limits/non-finite, %" PRIu64
+                           " scissored empty, %" PRIu64 " no pitch, %"
+                           PRIu64 " past VRAM",
+                           s->gl_rect_why[0], s->gl_rect_why[1],
+                           s->gl_rect_why[2], s->gl_rect_why[3]);
+#ifdef __APPLE__
+    g_string_append_printf(out, "\nmetal declined: %" PRIu64 " request, %"
+                           PRIu64 " no pipeline, %" PRIu64 " upload, %"
+                           PRIu64 " slot mismatch, %" PRIu64
+                           " vertex buffer; %" PRIu64 " stale slots "
+                           "re-uploaded",
+                           r350_mtl_decline[0], r350_mtl_decline[1],
+                           r350_mtl_decline[2], r350_mtl_decline[3],
+                           r350_mtl_decline[4], r350_mtl_decline[5]);
+#endif
     /*
      * WHICH hook ended each residency. "the target is not staying
      * resident" is a symptom whose cure depends entirely on which rule
@@ -5218,6 +5358,27 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                                    ", %" PRIu64 " px",
                                    ati_r350_gl_rel_name(k), s->gl_rel[k],
                                    s->gl_rel_px[k]);
+        }
+    }
+    {
+        uint64_t wt = 0;
+
+        for (k = 0; k < R350_GLR_MAX; k++) {
+            wt += s->gl_wait_ns[k];
+        }
+        g_string_append_printf(out, "\nhost time (ms): %" PRIu64
+                               " software draws (%" PRIu64 "), %" PRIu64
+                               " GPU encoding (%" PRIu64 "), %" PRIu64
+                               " waiting on the GPU",
+                               s->sw_draw_ns / 1000000, s->sw_draw_n,
+                               s->gpu_prep_ns / 1000000, s->gpu_prep_n,
+                               wt / 1000000);
+        for (k = 0; k < R350_GLR_MAX; k++) {
+            if (s->gl_wait_ns[k]) {
+                g_string_append_printf(out, "\n  waiting, %s: %" PRIu64
+                                       " ms", ati_r350_gl_rel_name(k),
+                                       s->gl_wait_ns[k] / 1000000);
+            }
         }
     }
     /*
@@ -5242,6 +5403,21 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
         g_string_append_printf(out, "\nfragment shaders: %" PRIu64
                                " cache hits, %" PRIu64 " linked, %" PRIu64
                                " would not build", ph, pl, pf);
+        g_string_append_printf(out, "\nfragment programs refused: "
+                               "%" PRIu64 " uninterpretable, %" PRIu64
+                               " multi-level, %" PRIu64 " TEXKILL, %" PRIu64
+                               " multi-fetch, %" PRIu64 " unit!=0, %" PRIu64
+                               " coord set; units 0x%x",
+                               s->us_refuse[0], s->us_refuse[1],
+                               s->us_refuse[2], s->us_refuse[3],
+                               s->us_refuse[4], s->us_refuse[5],
+                               s->us_refuse_units);
+        g_string_append_printf(out, "\n  general path refused: %" PRIu64
+                               " other, %" PRIu64 " more than 4 units, %"
+                               PRIu64 " coord set above 3, %" PRIu64
+                               " cube map",
+                               s->us_grefuse[0], s->us_grefuse[1],
+                               s->us_grefuse[2], s->us_grefuse[3]);
         if (ati_r350_gl_barriers(s->gl_ctx)) {
             uint64_t qu, qf, qw;
 
@@ -5454,6 +5630,31 @@ static char *ati_r350_get_palette(Object *obj, Error **errp)
  * existed still means what it said; `draw-capture-arm=off` on the
  * -device line is what defers a capture to the monitor.
  */
+/*
+ * regtrace-arm: start the register trace now, from the monitor --
+ *   qom-set /machine/peripheral/gpu regtrace-arm true
+ * for a guest whose screen never changes mode (a windowed game).
+ * Needs regtrace=<file> on the -device line.
+ */
+static bool ati_r350_get_rt_arm(Object *obj, Error **errp)
+{
+    return ATI_R350(obj)->rt_armed;
+}
+
+static void ati_r350_set_rt_arm(Object *obj, bool value, Error **errp)
+{
+    ATIR350State *s = ATI_R350(obj);
+
+    if (!s->rt_path) {
+        error_setg(errp, "regtrace-arm needs regtrace=<file>");
+        return;
+    }
+    if (value && !s->rt_armed && !s->rt_done) {
+        s->rt_armed = true;
+        ati_r350_rt_printf(s, "# armed from the monitor\n");
+    }
+}
+
 static bool ati_r350_get_cap_arm(Object *obj, Error **errp)
 {
     return ATI_R350(obj)->cap_arm;
@@ -5475,6 +5676,9 @@ static void ati_r350_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
+    object_class_property_add_bool(klass, "regtrace-arm",
+                                   ati_r350_get_rt_arm,
+                                   ati_r350_set_rt_arm);
     object_class_property_add_bool(klass, "draw-capture-arm",
                                    ati_r350_get_cap_arm,
                                    ati_r350_set_cap_arm);
@@ -5534,3 +5738,97 @@ static void ati_r350_register_types(void)
 }
 
 type_init(ati_r350_register_types)
+
+/* regtrace: see rt_path in ati_r350_int.h */
+static QemuMutex rt_lock;
+static bool rt_lock_inited;
+
+static void rt_lock_take(void)
+{
+    if (!rt_lock_inited) {
+        qemu_mutex_init(&rt_lock);
+        rt_lock_inited = true;
+    }
+    qemu_mutex_lock(&rt_lock);
+}
+
+/* end the trace now (regtrace-tail: the game has gone back to its menu) */
+void ati_r350_rt_stop(ATIR350State *s, const char *why)
+{
+    rt_lock_take();
+    if (s->rt_fp) {
+        fprintf(s->rt_fp, "# stopped: %s\n", why);
+        fclose(s->rt_fp);
+        s->rt_fp = NULL;
+        warn_report("ati-radeon9800: regtrace stopped (%s): %s", why,
+                    s->rt_path);
+    }
+    s->rt_done = true;
+    qemu_mutex_unlock(&rt_lock);
+}
+
+void ati_r350_rt_printf(ATIR350State *s, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    rt_lock_take();
+    if (!s->rt_fp && !s->rt_done) {
+        s->rt_fp = fopen(s->rt_path, "w");
+        if (!s->rt_fp) {
+            error_report("ati-radeon9800: cannot open regtrace file %s",
+                         s->rt_path);
+            s->rt_done = true;
+        }
+    }
+    if (s->rt_fp) {
+        va_start(ap, fmt);
+        n = vfprintf(s->rt_fp, fmt, ap);
+        va_end(ap);
+        if (n > 0) {
+            uint64_t before = s->rt_bytes;
+
+            s->rt_bytes += n;
+            if ((before >> 16) != (s->rt_bytes >> 16)) {
+                fflush(s->rt_fp);
+            }
+        }
+        if (s->rt_tail && s->rt_bytes >= (uint64_t)s->rt_mb << 19) {
+            /*
+             * regtrace-tail: keep only the newest regtrace-mb.  Each
+             * half rolls over to <file>.prev and the new half opens
+             * with a full register snapshot, so either file reads on
+             * its own and the pair ends where the guest stopped.
+             */
+            g_autofree char *prev = g_strdup_printf("%s.prev", s->rt_path);
+            unsigned r;
+
+            fprintf(s->rt_fp, "# rolled over to the next segment\n");
+            fclose(s->rt_fp);
+            rename(s->rt_path, prev);
+            s->rt_fp = fopen(s->rt_path, "w");
+            s->rt_bytes = 0;
+            if (!s->rt_fp) {
+                s->rt_done = true;
+            } else {
+                fprintf(s->rt_fp, "# segment %u; register snapshot follows\n",
+                        ++s->rt_seg);
+                for (r = 0; r < ATI_R350_NUM_REGS; r++) {
+                    if (s->regs[r]) {
+                        fprintf(s->rt_fp, "S %04x %-28s %08x\n", r * 4,
+                                ati_r350_reg_name(r * 4), s->regs[r]);
+                    }
+                }
+                fprintf(s->rt_fp, "# snapshot end\n");
+            }
+        } else if (s->rt_bytes >= (uint64_t)s->rt_mb << 20) {
+            fprintf(s->rt_fp, "# stopped: regtrace-mb reached\n");
+            fclose(s->rt_fp);
+            s->rt_fp = NULL;
+            s->rt_done = true;
+            warn_report("ati-radeon9800: regtrace complete (%u MB): %s",
+                        s->rt_mb, s->rt_path);
+        }
+    }
+    qemu_mutex_unlock(&rt_lock);
+}

@@ -68,6 +68,13 @@ typedef struct R300Vtx {
      * the rasterizer interpolates for a set no fetch reads.
      */
     float tcr[R300_TEXCOORDS][4];
+    /*
+     * The CLIP-space position r300_xform_vtx() divided, kept so that a
+     * triangle crossing the eye plane can be clipped (r300_clip_tris)
+     * instead of drawn through a vertex parked at r300_vtx_nowhere.
+     * w = 1 for a vertex the transform never touched.
+     */
+    float clip[4];
 } R300Vtx;
 
 /*
@@ -86,6 +93,9 @@ typedef struct R300TexUnit {
     uint32_t pitch;         /* bytes per texel row */
     unsigned bpp;           /* bits per texel: 8, 16, 32 or 64 */
     unsigned code;          /* TX_FORMAT1 TXFORMAT, to tell the widths apart */
+    unsigned dxt;           /* 1, 3 or 5: S3TC compressed (DXTn), else 0 */
+    unsigned yuv;           /* 0x14/0x15: packed 4:2:2, else 0 */
+    bool yuv_rgb;           /* TX_FORMAT1 bit 22: convert YCbCr to RGB */
     unsigned sel[4];        /* TX_FORMAT1 component select, A R G B */
     unsigned clamp_s, clamp_t;  /* TX_FILTER0 clamp modes (0 = repeat) */
     unsigned lanes;         /* TX_OFFSET ENDIAN_SWAP as a byte-lane xor */
@@ -108,7 +118,17 @@ typedef struct R300TexUnit {
     unsigned nlev;          /* levels the GL backend is handed: 0..nlev-1 */
     uint32_t chain;         /* bytes from `off` to the end of that chain */
     size_t ltexels;         /* texels in those levels */
+    /*
+     * TX_FORMAT1 TEX_COORD_TYPE 2: a cube map. Each level holds the six
+     * faces back to back (+X -X +Y -Y +Z -Z), `fsz[l]` bytes apart; a
+     * fetch picks the face from its (s, t, r) vector.
+     */
+    bool cube;
+    uint32_t fsz[R300_TEX_LEVELS];
 } R300TexUnit;
+
+/* the cube face the calling thread's current fetch addresses */
+static __thread unsigned r300_cube_face;
 
 typedef struct R300DrawState {
     int sc_x0, sc_y0, sc_x1, sc_y1;   /* inclusive scissor window */
@@ -273,6 +293,7 @@ static inline bool r300_draw_fetches(const R300DrawState *d)
  */
 QEMU_BUILD_BUG_ON(R350_GL_TEXUNITS != R300_TEX_UNITS);
 QEMU_BUILD_BUG_ON(R350_GL_TEXCOORDS > R300_TEXCOORDS);
+QEMU_BUILD_BUG_ON(R350_GL_RAWSETS > R300_TEXCOORDS);
 QEMU_BUILD_BUG_ON(R350_CAP_TEX_UNITS != R300_TEX_UNITS);
 
 /*
@@ -636,6 +657,11 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
     return r300_lane_xor32(r300_tex_bus32(s, unit, addr), u->lanes);
 }
 
+static uint32_t r300_dxt_texel(ATIR350State *s, const R300DrawState *d,
+                               unsigned unit, unsigned l, int i, int j);
+static uint32_t r300_yuv_texel(ATIR350State *s, const R300DrawState *d,
+                               unsigned unit, unsigned l, int i, int j);
+
 static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
                                 unsigned unit, int tx, int ty)
 {
@@ -663,6 +689,12 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
         }
     } else {
         ty = MIN(MAX(ty, 0), u->h - 1);
+    }
+    if (u->dxt) {
+        return r300_dxt_texel(s, d, unit, 0, tx, ty);
+    }
+    if (u->yuv) {
+        return r300_yuv_texel(s, d, unit, 0, tx, ty);
     }
     return r300_tex_at(s, d, unit, u->off + (uint32_t)ty * u->pitch +
                                    (uint32_t)tx * (u->bpp / 8));
@@ -740,6 +772,224 @@ static inline int r300_tc_idx(int i, int n, unsigned mode, bool point)
     }
 }
 
+/*
+ * S3TC (DXT1/3/5), TX_FORMAT1 codes 0x0f/0x10/0x11. Jedi Outcast (10.4)
+ * stores nearly every texture DXT5; read as 8888 they were static.
+ *
+ * LAYOUT, from the addresses the driver binds: each level is rows of 4x4
+ * blocks (8 bytes DXT1, 16 DXT3/5), a block row padded to 32 bytes, the
+ * levels packed one after another -- 512x512 DXT5 textures sit 0x40000
+ * apart, 128x128 ones 0x4000, a 32x32 five-level chain fits in one 4 KB
+ * page, all whatever TX_OFFSET's tile bits say. Mesa's r300 layout for
+ * an untiled compressed texture is the same.
+ *
+ * COMPONENTS: the block is decoded to R, G, B, A and handed to the
+ * selector as X = A, Y = B, Z = G, W = R -- the decoded dword as the
+ * aperture's 32-bit swapper presents it, and the order the driver's own
+ * TX_FORMAT1 selects (A<-X, R<-W, G<-Z, B<-Y, 0x00053011) undo.
+ */
+#define R300_TX_FMT_DXT1 0x0f
+#define R300_TX_FMT_DXT3 0x10
+#define R300_TX_FMT_DXT5 0x11
+
+static uint8_t r300_tex_byte(ATIR350State *s, const R300DrawState *d,
+                             unsigned unit, uint32_t addr)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    uint32_t off;
+
+    if (d->tvx[unit].ok && addr - u->off < d->tvx[unit].len) {
+        return d->vram[(d->tvx[unit].off + (addr - u->off)) ^
+                       (d->tvx[unit].xr & 3)];
+    }
+    if (ati_r350_mc_to_vram(s, addr, &off)) {
+        if (off >= ATI_R350_VRAM_SIZE) {
+            return 0;
+        }
+        return ((uint8_t *)memory_region_get_ram_ptr(&s->vram))
+               [off ^ (ati_r350_vram_xor(s, off) & 3)];
+    }
+    return (r300_tex_bus32(s, unit, addr & ~3u) >>
+            (((addr ^ u->lanes) & 3) * 8)) & 0xff;
+}
+
+static inline void r300_c565(uint32_t c, uint32_t *r, uint32_t *g,
+                             uint32_t *b)
+{
+    *r = (c >> 11) & 31;
+    *r = (*r << 3) | (*r >> 2);
+    *g = (c >> 5) & 63;
+    *g = (*g << 2) | (*g >> 4);
+    *b = c & 31;
+    *b = (*b << 3) | (*b >> 2);
+}
+
+/*
+ * One whole 4x4 block, all sixteen texels in row order, each as
+ * alpha | b << 8 | g << 16 | r << 24 (X=A, Y=B, Z=G, W=R). Decoding a
+ * block costs about what decoding one texel of it did, so the texture
+ * decode below takes blocks whole: per texel, JK2's DXT5 textures cost
+ * the command processor half its time.
+ */
+static void r300_dxt_block(ATIR350State *s, const R300DrawState *d,
+                           unsigned unit, uint32_t a, uint32_t out[16])
+{
+    const R300TexUnit *u = &d->tex[unit];
+    unsigned bs = u->dxt == 1 ? 8 : 16, k, t;
+    uint8_t b[16];
+    const uint8_t *cb;
+    uint32_t c0, c1, idx, r[4], g[4], bl[4], al[4] = { 255, 255, 255, 255 };
+    uint32_t apal[8];
+    uint64_t ab = 0;
+
+    for (k = 0; k < bs; k++) {
+        b[k] = r300_tex_byte(s, d, unit, a + k);
+    }
+    cb = u->dxt == 1 ? b : b + 8;
+    c0 = cb[0] | (cb[1] << 8);
+    c1 = cb[2] | (cb[3] << 8);
+    idx = cb[4] | (cb[5] << 8) | (cb[6] << 16) | ((uint32_t)cb[7] << 24);
+    r300_c565(c0, &r[0], &g[0], &bl[0]);
+    r300_c565(c1, &r[1], &g[1], &bl[1]);
+    if (u->dxt != 1 || c0 > c1) {
+        r[2] = (2 * r[0] + r[1]) / 3;
+        g[2] = (2 * g[0] + g[1]) / 3;
+        bl[2] = (2 * bl[0] + bl[1]) / 3;
+        r[3] = (r[0] + 2 * r[1]) / 3;
+        g[3] = (g[0] + 2 * g[1]) / 3;
+        bl[3] = (bl[0] + 2 * bl[1]) / 3;
+    } else {
+        r[2] = (r[0] + r[1]) / 2;
+        g[2] = (g[0] + g[1]) / 2;
+        bl[2] = (bl[0] + bl[1]) / 2;
+        r[3] = g[3] = bl[3] = 0;
+        al[3] = 0;                      /* DXT1 punch-through */
+    }
+    if (u->dxt == 5) {
+        uint32_t a0 = b[0], a1 = b[1];
+        unsigned ai;
+
+        for (ai = 0; ai < 6; ai++) {
+            ab |= (uint64_t)b[2 + ai] << (8 * ai);
+        }
+        apal[0] = a0;
+        apal[1] = a1;
+        for (ai = 2; ai < 8; ai++) {
+            if (a0 > a1) {
+                apal[ai] = ((8 - ai) * a0 + (ai - 1) * a1) / 7;
+            } else if (ai < 6) {
+                apal[ai] = ((6 - ai) * a0 + (ai - 1) * a1) / 5;
+            } else {
+                apal[ai] = ai == 6 ? 0 : 255;
+            }
+        }
+    }
+    for (t = 0; t < 16; t++) {
+        uint32_t alpha;
+
+        k = (idx >> (2 * t)) & 3;
+        if (u->dxt == 1) {
+            alpha = al[k];
+        } else if (u->dxt == 3) {
+            alpha = ((b[t >> 1] >> ((t & 1) * 4)) & 15) * 17;
+        } else {
+            alpha = apal[(ab >> (3 * t)) & 7];
+        }
+        /*
+         * The two families come out of the sampler in different lane
+         * orders, and the driver's selects say so: DXT3/5 are always
+         * selected A<-X R<-W G<-Z B<-Y (0x00053010/11, JK2 and Halo
+         * alike), DXT1 A<-1 R<-Z G<-Y B<-X (0x0000aa0f, Halo) -- the
+         * 8888 desktop order. Packing DXT1 like DXT5 put alpha (255)
+         * in blue: Halo's whole menu came out saturated blue.
+         */
+        out[t] = u->dxt == 1
+                 ? bl[k] | (g[k] << 8) | (r[k] << 16) | (alpha << 24)
+                 : alpha | (bl[k] << 8) | (g[k] << 16) | (r[k] << 24);
+    }
+}
+
+/*
+ * The software path samples DXT one texel at a time -- a bilinear,
+ * mipmapped fetch is eight of them -- and each decoded its whole block
+ * again: half the command processor and raster threads' time in Halo.
+ * A small per-thread cache of decoded blocks, valid for one draw only
+ * (r300_draw_gen), so a texture rewritten between draws is never read
+ * stale. Bus textures in a raster shadow are keyed the same way: their
+ * shadow is fixed for the draw too.
+ */
+#define R300_DXT_TC 64
+typedef struct {
+    uint64_t gen;
+    uint32_t a;
+    unsigned dxt;
+    uint32_t blk[16];
+} R300DxtTc;
+static __thread R300DxtTc r300_dxt_tc[R300_DXT_TC];
+
+static uint32_t r300_dxt_texel(ATIR350State *s, const R300DrawState *d,
+                               unsigned unit, unsigned l, int i, int j)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    unsigned bs = u->dxt == 1 ? 8 : 16;
+    uint32_t a = u->loff[l] + (uint32_t)(j >> 2) * u->lpitch[l] +
+                 (uint32_t)(i >> 2) * bs;
+    uint64_t gen = qatomic_read(&s->r300_draw_gen);
+    R300DxtTc *c = &r300_dxt_tc[((a >> 3) ^ (a >> 11)) & (R300_DXT_TC - 1)];
+
+    if (c->gen != gen || c->a != a || c->dxt != u->dxt) {
+        r300_dxt_block(s, d, unit, a, c->blk);
+        c->gen = gen;
+        c->a = a;
+        c->dxt = u->dxt;
+    }
+    return c->blk[(j & 3) * 4 + (i & 3)];
+}
+
+/*
+ * PACKED 4:2:2, formats 0x14 (B8G8_B8G8) and 0x15 (G8R8_G8B8): two
+ * texels per dword sharing one chroma pair -- QuickTime's video
+ * textures. Halo's cinematics use both, with TX_FORMAT1 bit 22
+ * (YUV_TO_RGB) set and the DXT3/5 select (0x00453014/15), so the result
+ * is packed in that lane order: A in X, B in Y, G in Z, R in W.
+ *
+ * Byte order, after the aperture swapper: 0x14 Cb Y0 Cr Y1 (UYVY,
+ * Apple '2vuy'), 0x15 Y0 Cb Y1 Cr (YUY2, 'yuvs'). Conversion is
+ * BT.601 video range, as Apple's YCbCr textures are.
+ */
+static uint32_t r300_yuv_texel(ATIR350State *s, const R300DrawState *d,
+                               unsigned unit, unsigned l, int i, int j)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    uint32_t a = u->loff[l] + (uint32_t)j * u->lpitch[l] +
+                 (uint32_t)(i >> 1) * 4;
+    uint8_t b0 = r300_tex_byte(s, d, unit, a);
+    uint8_t b1 = r300_tex_byte(s, d, unit, a + 1);
+    uint8_t b2 = r300_tex_byte(s, d, unit, a + 2);
+    uint8_t b3 = r300_tex_byte(s, d, unit, a + 3);
+    int y, cb, cr, r, g, b;
+
+    if (u->yuv == 0x14) {
+        cb = b0; cr = b2; y = (i & 1) ? b3 : b1;
+    } else {
+        cb = b1; cr = b3; y = (i & 1) ? b2 : b0;
+    }
+    if (u->yuv_rgb) {
+        float yf = 1.164f * (y - 16);
+
+        r = (int)lrintf(yf + 1.596f * (cr - 128));
+        g = (int)lrintf(yf - 0.813f * (cr - 128) - 0.391f * (cb - 128));
+        b = (int)lrintf(yf + 2.018f * (cb - 128));
+        r = MIN(MAX(r, 0), 255);
+        g = MIN(MAX(g, 0), 255);
+        b = MIN(MAX(b, 0), 255);
+    } else {
+        r = cr; g = y; b = cb;
+    }
+    return 255u | ((uint32_t)b << 8) | ((uint32_t)g << 16) |
+           ((uint32_t)r << 24);
+}
+
 static inline uint32_t r300_tex_lvl_texel(ATIR350State *s,
                                           const R300DrawState *d,
                                           unsigned unit, unsigned l,
@@ -750,7 +1000,15 @@ static inline uint32_t r300_tex_lvl_texel(ATIR350State *s,
     if (i < 0 || j < 0) {
         return u->border;
     }
-    return r300_tex_at(s, d, unit, u->loff[l] + (uint32_t)j * u->lpitch[l] +
+    if (u->dxt) {
+        return r300_dxt_texel(s, d, unit, l, i, j);
+    }
+    if (u->yuv) {
+        return r300_yuv_texel(s, d, unit, l, i, j);
+    }
+    return r300_tex_at(s, d, unit, u->loff[l] +
+                                   (u->cube ? r300_cube_face * u->fsz[l] : 0) +
+                                   (uint32_t)j * u->lpitch[l] +
                                    (uint32_t)i * (u->bpp / 8));
 }
 
@@ -1587,7 +1845,50 @@ static void r300_us_sample(void *ctx, unsigned unit, bool proj,
         return;
     }
     u = &d->tex[unit];
-    if (u->filt) {
+    if (u->cube) {
+        /*
+         * GL's face selection (OpenGL 1.3, table 3.19): the major axis
+         * names the face, the other two over its magnitude address it.
+         */
+        float x = coord[0], y = coord[1], z = coord[2];
+        float ax = fabsf(x), ay = fabsf(y), az = fabsf(z), ma, sc, tc;
+        float der[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        unsigned face;
+
+        if (ax >= ay && ax >= az) {
+            face = x >= 0.0f ? 0 : 1;
+            ma = ax;
+            sc = x >= 0.0f ? -z : z;
+            tc = -y;
+        } else if (ay >= az) {
+            face = y >= 0.0f ? 2 : 3;
+            ma = ay;
+            sc = x;
+            tc = y >= 0.0f ? z : -z;
+        } else {
+            face = z >= 0.0f ? 4 : 5;
+            ma = az;
+            sc = z >= 0.0f ? x : -x;
+            tc = -y;
+        }
+        if (!(ma > 0.0f)) {
+            ma = 1.0f;
+        }
+        if (u->need_lod) {
+            const float *g = r300_us_der(c, unit, src);
+            float k = 0.5f / ma;
+
+            der[0] = g[0] * k * (float)u->w;
+            der[1] = g[1] * k * (float)u->h;
+            der[2] = g[2] * k * (float)u->w;
+            der[3] = g[3] * k * (float)u->h;
+        }
+        r300_cube_face = face;
+        t = r300_tex_filter(c->s, d, unit,
+                            (sc / ma + 1.0f) * 0.5f * (float)u->w,
+                            (tc / ma + 1.0f) * 0.5f * (float)u->h, der);
+        r300_cube_face = 0;
+    } else if (u->filt) {
         float der[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
         if (u->need_lod) {
@@ -1940,10 +2241,11 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
             }
             if (!d->wmask) {
                 /* depth-only pass: nothing to shade */
-                if (s->zb.z_en) {
-                    r300_zb_pixel(s, d, x, y,
-                                  w0 * v0->z + w1 * v1->z + w2 * v2->z,
-                                  back);
+                if ((!s->zb.z_en ||
+                     r300_zb_pixel(s, d, x, y,
+                                   w0 * v0->z + w1 * v1->z + w2 * v2->z,
+                                   back)) && unlikely(s->zq_active)) {
+                    qatomic_inc(&s->zpass_count);   /* occlusion query */
                 }
                 continue;
             }
@@ -2177,6 +2479,9 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                                back)) {
                 continue;
             }
+            if (unlikely(s->zq_active)) {
+                qatomic_inc(&s->zpass_count);   /* an occlusion query */
+            }
             if (d->discard) {
                 /*
                  * DISCARD_SRC_PIXELS: skip the colour write for source
@@ -2312,6 +2617,8 @@ static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
 
     if (!d->xform) {
         v->w = 1.0f;
+        v->clip[0] = v->clip[1] = v->clip[2] = 0.0f;
+        v->clip[3] = 1.0f;
         return;
     }
     if (clip) {
@@ -2340,6 +2647,10 @@ static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
      * treatment the raw, untransformable coordinates need, since those
      * are unbounded floats that floor into nonsense of their own.
      */
+    v->clip[0] = cx;
+    v->clip[1] = cy;
+    v->clip[2] = cz;
+    v->clip[3] = cw;
     if (!isfinite(cx) || !isfinite(cy) || !isfinite(cw) ||
         fabsf(cw) < 0.000001f) {
         v->x = v->y = r300_vtx_nowhere;
@@ -3451,6 +3762,57 @@ static void r300_pvs_translate(ATIR350State *s, const R300PvsProgram *p)
  * old `texel * colour`, which was never anything but a guess at what a
  * program computes and is what this milestone removes.
  */
+/*
+ * us-dump: every distinct translated fragment program, once, with the
+ * texture and routing state of the draw that first used it -- what a
+ * program that renders wrong on BOTH paths has to be read against.
+ */
+static void r300_us_dump(ATIR350State *s, const uint32_t *regs)
+{
+    unsigned i;
+    FILE *f;
+
+    for (i = 0; i < s->us_dump_n; i++) {
+        if (s->us_dump_seen[i] == s->us_glsl_key) {
+            return;
+        }
+    }
+    if (s->us_dump_n >= ARRAY_SIZE(s->us_dump_seen)) {
+        return;
+    }
+    s->us_dump_seen[s->us_dump_n++] = s->us_glsl_key;
+    f = fopen(s->us_dump_path, "a");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "==== program %016" PRIx64 " US_CONFIG %08x TX_ENABLE %08x\n",
+            s->us_glsl_key, regs[R300_US_CONFIG >> 2],
+            regs[R300_TX_ENABLE >> 2]);
+    for (i = 0; i < 8; i++) {
+        fprintf(f, "unit %u: FILTER0 %08x FILTER1 %08x FORMAT0 %08x "
+                "FORMAT1 %08x FORMAT2 %08x OFFSET %08x\n", i,
+                regs[(R300_TX_FILTER0_0 >> 2) + i],
+                regs[(R300_TX_FILTER1_0 >> 2) + i],
+                regs[(R300_TX_FORMAT0_0 >> 2) + i],
+                regs[(R300_TX_FORMAT1_0 >> 2) + i],
+                regs[(R300_TX_FORMAT2_0 >> 2) + i],
+                regs[(R300_TX_OFFSET_0 >> 2) + i]);
+    }
+    for (i = 0; i < 8; i++) {
+        fprintf(f, "RS_IP%u %08x RS_INST%u %08x\n", i,
+                regs[(R300_RS_IP_0 >> 2) + i], i,
+                regs[(R300_RS_INST_0 >> 2) + i]);
+    }
+    for (i = 0; i < 8; i++) {
+        unsigned k = (R300_PFS_PARAM_0_X >> 2) + i * 4;
+
+        fprintf(f, "C%u %08x %08x %08x %08x\n", i, regs[k], regs[k + 1],
+                regs[k + 2], regs[k + 3]);
+    }
+    fprintf(f, "%s\n", s->us_glsl);
+    fclose(f);
+}
+
 static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
 {
     R300UsProgram *p = &s->us_prog;
@@ -3581,7 +3943,23 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
          * translation and one shader link -- and so that a program the
          * translator refuses is refused before any pixel depends on it.
          */
-        s->us_glsl_ok = r300_us_glsl(p, s->us_glsl, sizeof(s->us_glsl));
+        s->us_glsl_ok = r300_us_glsl(p, s->us_glsl, sizeof(s->us_glsl),
+                                     s->gl_api && !strcmp(s->gl_api, "metal"),
+                                     false);
+        s->us_glsl_gen_ok = false;
+        if (s->us_glsl_ok && p->gl_multi && p->gl_general &&
+            s->gl_api && !strcmp(s->gl_api, "metal") &&
+            r300_us_glsl(p, s->us_glsl_gen, sizeof(s->us_glsl_gen), true,
+                         true)) {
+            const char *c = s->us_glsl_gen;
+            uint64_t h = 1469598103934665603ULL;
+
+            while (*c) {
+                h = (h ^ (uint8_t)*c++) * 1099511628211ULL;
+            }
+            s->us_glsl_gen_key = h | 1;
+            s->us_glsl_gen_ok = true;
+        }
         /*
          * The key the GL backend caches its linked shader under is a
          * hash of the TEXT, not of the control words. Those change far
@@ -3600,6 +3978,9 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
             }
             s->us_glsl_key = h | 1;
             s->us_glsl_ok_n++;
+            if (s->us_dump_path) {
+                r300_us_dump(s, regs);
+            }
         } else {
             s->us_glsl_key = 0;
             s->us_glsl_refused_n++;
@@ -3664,7 +4045,12 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
             continue;
         }
         for (k = 0; k < d->ntc; k++) {
-            if (p->rs.tex_reg[k] == t->src) {
+            /*
+             * A cube map is addressed by (s, t, r): its set reaches the
+             * frame raw, not as the (s/q, t/q, 0, 1) of a 2D fetch.
+             */
+            if (p->rs.tex_reg[k] == t->src &&
+                !(t->unit < R300_TEX_UNITS && d->tex[t->unit].cube)) {
                 d->tc_raw &= ~(1u << k);
             }
         }
@@ -3863,14 +4249,35 @@ static void r300_tex_filter_setup(ATIR350State *s, R300TexUnit *u,
         u->lh[l] = h;
         u->loff[l] = a;
         u->lpitch[l] = l ? ROUND_UP(w, aw) * bytes : u->pitch;
-        a += ROUND_UP(w, aw) * bytes * ROUND_UP(h, ah);
+        u->fsz[l] = ROUND_UP(w, aw) * bytes * ROUND_UP(h, ah);
+        a += u->fsz[l] * (u->cube ? 6 : 1);
     }
     /* one level is addressed, and cached, exactly as before */
+    if (u->dxt) {
+        /* block rows, 32-byte aligned, levels packed: r300_dxt_texel() */
+        unsigned bs = u->dxt == 1 ? 8 : 16;
+
+        a = u->off;
+        for (l = 0; l <= u->last; l++) {
+            uint32_t bw = (uint32_t)(u->lw[l] + 3) / 4;
+            uint32_t bh = (uint32_t)(u->lh[l] + 3) / 4;
+
+            u->loff[l] = a;
+            u->lpitch[l] = ROUND_UP(bw * bs, 32);
+            a += u->lpitch[l] * bh;
+        }
+        /* the byte span per texel row, for the range checks elsewhere */
+        u->pitch = u->lpitch[0] / 4;
+    }
     u->nlev = u->filt ? u->last + 1 : 1;
-    u->chain = u->nlev > 1 ? a - u->off : (uint32_t)u->h * u->pitch;
+    u->chain = u->nlev > 1 || u->cube ? a - u->off
+                                      : (uint32_t)u->h * u->pitch;
     u->ltexels = 0;
     for (l = 0; l < u->nlev; l++) {
         u->ltexels += (size_t)u->lw[l] * u->lh[l];
+    }
+    if (u->cube) {
+        u->ltexels *= 6;    /* the backend's copy: faces stacked per level */
     }
 }
 
@@ -3908,7 +4315,16 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
      * span two texels.
      */
     u->code = txcode;
+    u->dxt = 0;
+    u->yuv = 0;
+    u->yuv_rgb = false;
     switch (txcode) {
+    case 0x14:          /* B8G8_B8G8 */
+    case 0x15:          /* G8R8_G8B8 */
+        u->bpp = 16;
+        u->yuv = txcode;
+        u->yuv_rgb = (txfmt1 >> 22) & 1;
+        break;
     case R300_TX_FMT_8:
         u->bpp = 8;
         break;
@@ -3923,6 +4339,14 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
         break;
     case R300_TX_FMT_8_8_8_8:
         u->bpp = 32;
+        break;
+    case R300_TX_FMT_DXT1:
+    case R300_TX_FMT_DXT3:
+    case R300_TX_FMT_DXT5:
+        /* decoded per texel to a 32-bit XYZW; see r300_dxt_texel() */
+        u->bpp = 32;
+        u->dxt = txcode == R300_TX_FMT_DXT1 ? 1 :
+                 txcode == R300_TX_FMT_DXT3 ? 3 : 5;
         break;
     default:
         /* the rest are being read as if their components were bytes */
@@ -3948,6 +4372,11 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
     }
     u->clamp_s = filt0 & 7;
     u->clamp_t = (filt0 >> 3) & 7;
+    u->cube = ((txfmt1 >> 25) & 3) == 2 && !u->dxt && !u->yuv;
+    if (u->cube) {
+        /* a face's edge is the next face's; never wrap within one */
+        u->clamp_s = u->clamp_t = 2;
+    }
     /*
      * The pitch register only applies when TX_FORMAT0 says so;
      * otherwise rows are exactly the texture's width.
@@ -3958,6 +4387,9 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
         u->pitch = (uint32_t)u->w * (u->bpp / 8);
     }
     r300_tex_filter_setup(s, u, unit, txfmt0, filt0);
+    if (u->cube) {
+        u->filt = true;     /* r300_sample_tex() knows no faces */
+    }
 }
 
 /*
@@ -4004,6 +4436,9 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     unsigned first_color = 0, ncolor = 0, first_tex = 0;
     bool vs_live = false;
     unsigned i;
+
+    /* a new draw: decoded DXT blocks of the last one are not trusted */
+    qatomic_set(&s->r300_draw_gen, s->r300_draw_gen + 1);
 
     d->cb_fmt = (colorpitch >> R300_COLORFORMAT_SHIFT) &
                 R300_COLORFORMAT_MASK;
@@ -4185,8 +4620,30 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      * coordinate: four of Beach.saver's draws would change and there is
      * no evidence they should.
      */
-    d->textured = (s->regs[R300_TX_ENABLE >> 2] & 1) &&
+    d->textured = (s->regs[R300_TX_ENABLE >> 2] & 0xffff) &&
                   (vsize >= 8 || r300_pvs_computes(&d->vs, first_tex));
+    /*
+     * ...AND AN INTERLEAVED VERTEX WHOSE PROGRAM FORWARDS ITS COORDINATE.
+     * Quake 3 (10.4) draws everything as one 6-dword array -- FLOAT_3
+     * position, byte colour, FLOAT_2 coordinate into in[2] -- and its
+     * program is out[2] = in[2]. Neither test above admits it, so every
+     * glyph and wall was drawn untextured. Admitted only when the stream
+     * control accounts for the whole vertex (r300_stream_route derives a
+     * layout) and the forwarded input really carries two dwords or more:
+     * the narrow, register-described case, not the Beach.saver draws the
+     * paragraph above keeps out.
+     */
+    if (!d->textured && s->r300_aos_wide &&
+        (s->regs[R300_TX_ENABLE >> 2] & 0xffff) && d->vs.valid &&
+        first_tex < R300_PVS_OUT_REGS && d->vs.out_src[first_tex] >= 0) {
+        unsigned tsz[R300_AOS_MAX] = { vsize };
+        unsigned tcnt = 1;
+        unsigned in = d->vs.out_src[first_tex];
+        R300VtxFmt tf = { 0 };
+
+        r300_stream_route(s, tsz, &tcnt, vsize, &tf);
+        d->textured = tf.valid && in < tcnt && tsz[in] >= 2;
+    }
     /*
      * RB3D_BLENDCNTL (R5xx accel guide): bit 0 is ALPHA_BLEND_ENABLE,
      * SRCBLEND lives in [21:16] and DESTBLEND in [29:24] as 6-bit
@@ -5134,7 +5591,7 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
          * r300_draw_fetches() while the enables keep following
          * TX_ENABLE.
          */
-        d->textured = s->regs[R300_TX_ENABLE >> 2] & 1;
+        d->textured = s->regs[R300_TX_ENABLE >> 2] & 0xffff;
         for (u = 0; u < R300_TEX_UNITS; u++) {
             d->tex[u].en = d->textured &&
                            (s->regs[R300_TX_ENABLE >> 2] & (1u << u));
@@ -5355,9 +5812,18 @@ static bool r300_cap_rect(ATIR350State *s, const R300DrawState *d,
         fx0 -= hw; fx1 += hw;
         fy0 -= hh; fy1 += hh;
     }
+    /*
+     * +-1e6, not +-1e5. Quake 3-engine walls that pass just in front of
+     * the eye project corners hundreds of thousands of pixels to the
+     * side; at 1e5 JK2's timedemo sent ~26000 such draws to the
+     * software rasterizer (and a GPU wait before each). Both paths
+     * clamp the scan to the scissor, and at 1e6 a float still resolves
+     * a sixteenth of a pixel, so the barycentrics both compute agree.
+     */
     if (!isfinite(fx0) || !isfinite(fy0) || !isfinite(fx1) ||
-        !isfinite(fy1) || fx0 < -100000.0f || fx1 > 100000.0f ||
-        fy0 < -100000.0f || fy1 > 100000.0f) {
+        !isfinite(fy1) || fx0 < -1000000.0f || fx1 > 1000000.0f ||
+        fy0 < -1000000.0f || fy1 > 1000000.0f) {
+        s->gl_rect_why[0]++;
         return false;
     }
     x0 = (int)floorf(fx0) - 1;
@@ -5372,9 +5838,11 @@ static bool r300_cap_rect(ATIR350State *s, const R300DrawState *d,
         if (empty) {
             *empty = true;
         }
+        s->gl_rect_why[1]++;
         return false;
     }
     if (!d->dst_pitch) {
+        s->gl_rect_why[2]++;
         return false;
     }
     /* every byte of the rectangle has to be inside VRAM to be captured */
@@ -5384,6 +5852,7 @@ static bool r300_cap_rect(ATIR350State *s, const R300DrawState *d,
         y1--;
     }
     if (y1 <= y0) {
+        s->gl_rect_why[3]++;
         return false;
     }
     *rx0 = x0; *ry0 = y0; *rx1 = x1; *ry1 = y1;
@@ -5745,6 +6214,15 @@ static const char r300_gl_zonly_us[] =
     "    outc = col0;\n"
     "}\n";
 #define R300_GL_ZONLY_KEY 0x7a6f6e6c79000001ull
+/* the same for a backend that takes the two-texel us_main() (Metal) */
+static const char r300_gl_zonly_us_multi[] =
+    "void us_main(vec4 tex0, vec4 col0, vec4 col1, vec4 tex1, vec4 tex2,\n"
+    "             vec4 tex3,\n"
+    "             out vec4 outc)\n"
+    "{\n"
+    "    outc = col0;\n"
+    "}\n";
+#define R300_GL_ZONLY_KEY_MULTI 0x7a6f6e6c79000003ull
 
 /* the VRAM bytes the resident depth buffer can occupy; empty when none */
 static bool r300_gl_zspan(ATIR350State *s, uint32_t *lo, uint32_t *hi)
@@ -6250,7 +6728,10 @@ void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
          * target back is waiting for them to finish -- no pixel moves.
          */
         if (s->gl_res) {
+            int64_t t0 = get_clock();
+
             ati_r350_gl_wait(s->gl_ctx);
+            s->gl_wait_ns[why] += get_clock() - t0;
             s->gl_dsyncs++;
             s->gl_res = false;
             if (s->gl_async) {
@@ -6749,7 +7230,7 @@ static unsigned r300_gl_point_list(ATIR350State *s, R300DrawState *d,
      * The sprite path re-derives this from TX_ENABLE alone -- a trap the
      * ledger names, because the setup flag is not the sprite's state.
      */
-    d->textured = s->regs[R300_TX_ENABLE >> 2] & 1;
+    d->textured = s->regs[R300_TX_ENABLE >> 2] & 0xffff;
     for (u = 0; u < R300_TEX_UNITS; u++) {
         d->tex[u].en = d->textured &&
                        (s->regs[R300_TX_ENABLE >> 2] & (1u << u));
@@ -7216,7 +7697,7 @@ static bool r300_gl_decode_tex32(ATIR350State *s, const R300DrawState *d,
     g_autofree uint32_t *row = NULL;
     int tx, ty;
 
-    if (u->bpp != 32 || u->w <= 0 || u->h <= 0) {
+    if (u->bpp != 32 || u->dxt || u->w <= 0 || u->h <= 0) {
         return false;
     }
     row = g_new(uint32_t, u->w);
@@ -7263,6 +7744,74 @@ static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
     unsigned l;
     int tx, ty;
 
+    /*
+     * A cube map: each level as one image six faces tall, +X at the
+     * top -- the shader's ufetch() offsets a face's rows by face x height.
+     */
+    if (u->cube) {
+        unsigned f;
+
+        p = rgba;
+        for (l = 0; l < u->nlev; l++) {
+            for (f = 0; f < 6; f++) {
+                r300_cube_face = f;
+                for (ty = 0; ty < u->lh[l]; ty++) {
+                    for (tx = 0; tx < u->lw[l]; tx++, p += 4) {
+                        uint32_t texel = r300_tex_lvl_texel(s, d, unit, l,
+                                                            tx, ty);
+
+                        p[0] = r300_texel_byte(u, texel, 1);
+                        p[1] = r300_texel_byte(u, texel, 2);
+                        p[2] = r300_texel_byte(u, texel, 3);
+                        p[3] = r300_texel_byte(u, texel, 0);
+                    }
+                }
+            }
+        }
+        r300_cube_face = 0;
+        return;
+    }
+
+    /*
+     * DXT: block by block, every level, into the same layout the loops
+     * below produce (level 0 at the front, the rest packed behind it).
+     */
+    if (u->dxt) {
+        unsigned bs = u->dxt == 1 ? 8 : 16;
+
+        p = rgba;
+        for (l = 0; l < u->nlev; l++) {
+            int lw = l ? u->lw[l] : u->w, lh = l ? u->lh[l] : u->h;
+            int bx, by;
+
+            for (by = 0; by < lh; by += 4) {
+                for (bx = 0; bx < lw; bx += 4) {
+                    uint32_t blk[16];
+                    uint32_t a = u->loff[l] +
+                                 (uint32_t)(by >> 2) * u->lpitch[l] +
+                                 (uint32_t)(bx >> 2) * bs;
+                    int x, y;
+
+                    r300_dxt_block(s, d, unit, a, blk);
+                    for (y = 0; y < 4 && by + y < lh; y++) {
+                        for (x = 0; x < 4 && bx + x < lw; x++) {
+                            uint32_t texel = blk[y * 4 + x];
+                            uint8_t *q = p +
+                                ((size_t)(by + y) * lw + bx + x) * 4;
+
+                            q[0] = r300_texel_byte(u, texel, 1);
+                            q[1] = r300_texel_byte(u, texel, 2);
+                            q[2] = r300_texel_byte(u, texel, 3);
+                            q[3] = r300_texel_byte(u, texel, 0);
+                        }
+                    }
+                }
+            }
+            p += (size_t)lw * lh * 4;
+        }
+        return;
+    }
+
     /* the levels after the first, one after another behind it */
     for (l = 1; l < u->nlev; l++) {
         for (ty = 0; ty < u->lh[l]; ty++) {
@@ -7308,6 +7857,7 @@ static void r300_gl_filt(const R300TexUnit *u, R350GlReq *r, unsigned i)
     f[8] = u->bias;
     f[9] = u->wl2;
     f[10] = u->hl2;
+    f[11] = u->cube;
     r->levels[i] = u->nlev;
     r->border[i][0] = r300_texel_byte(u, u->border, 1);
     r->border[i][1] = r300_texel_byte(u, u->border, 2);
@@ -7333,6 +7883,131 @@ static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
            s->gl_tex[k].sel[3] == u->sel[3] &&
            s->gl_tex[k].nlev == u->nlev &&
            s->gl_tex[k].lay == u->loff[u->nlev - 1] - u->off;
+}
+
+/*
+ * A texture in AGP/PCI memory, decoded for the host GPU: copy its whole
+ * chain to the host ONCE (ati_r350_mc_read_block, one translation per
+ * 4 KiB page) and let the decode read the copy through the raster's
+ * shadow -- the path r300_tex_bus32() already serves. Decoded straight,
+ * every dword went through the memory controller and QEMU's IOMMU walk:
+ * 83% of the command processor's time at Halo's menu, whose interface
+ * textures all live in AGP. Returns true when the caller must drop the
+ * shadow again after the decode.
+ */
+#define R300_GL_BUS_SHADOW_MAX (64u * 1024 * 1024)
+
+static bool r300_gl_shadow_bus(ATIR350State *s, const R300DrawState *d,
+                               unsigned unit)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    R300Raster *q = s->raster;
+    uint32_t off, base, len;
+    unsigned dw;
+
+    if (!q || q->shadowed[unit] || !u->chain ||
+        ati_r350_mc_to_vram(s, u->off, &off)) {
+        return false;
+    }
+    base = u->off & ~3u;
+    len = u->chain + (u->off & 3) + 8;
+    if (len > R300_GL_BUS_SHADOW_MAX) {
+        return false;
+    }
+    dw = (len + 3) / 4;
+    if (q->shadow_size[unit] < (size_t)dw * 4) {
+        g_free(q->shadow[unit]);
+        q->shadow_size[unit] = (size_t)dw * 4;
+        q->shadow[unit] = g_malloc(q->shadow_size[unit]);
+    }
+    q->shadow_base[unit] = base;
+    q->shadow_dw[unit] = dw;
+    ati_r350_mc_read_block(s, base, q->shadow[unit], dw);
+    q->shadowed[unit] = true;
+    return true;
+}
+
+static inline uint64_t r300_mix64(uint64_t h, uint64_t v)
+{
+    h ^= v;
+    h *= 0x100000001b3ull;
+    return h ^ (h >> 29);
+}
+
+/*
+ * A bus texture through the content-keyed cache: copy its chain to the
+ * host (one translation per page), hash the copy, and decode only when
+ * no entry holds these bytes decoded these parameters' way. Returns the
+ * decoded texels, or NULL when the texture cannot be shadowed (then the
+ * caller decodes it the slow way).
+ */
+static const uint8_t *r300_gl_btex(ATIR350State *s, const R300DrawState *d,
+                                   unsigned unit)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    R300Raster *q = s->raster;
+    size_t need = u->ltexels * 4;
+    uint64_t key = 0xcbf29ce484222325ull, hash = 0x84222325cbf29ce4ull;
+    unsigned k, victim = 0, i;
+
+    if (!need || !r300_gl_shadow_bus(s, d, unit)) {
+        return NULL;
+    }
+    key = r300_mix64(key, u->off);
+    key = r300_mix64(key, ((uint64_t)u->w << 32) | (uint32_t)u->h);
+    key = r300_mix64(key, ((uint64_t)u->pitch << 32) | u->chain);
+    key = r300_mix64(key, ((uint64_t)u->bpp << 40) | ((uint64_t)u->code << 32) |
+                          ((uint64_t)u->yuv_rgb << 24) | (u->lanes << 16) |
+                          u->nlev);
+    key = r300_mix64(key, ((uint64_t)u->sel[0] << 48) |
+                          ((uint64_t)u->sel[1] << 32) |
+                          ((uint64_t)u->sel[2] << 16) | u->sel[3]);
+    key = r300_mix64(key, u->ltexels);
+    for (i = 0; i < u->nlev && i < R300_TEX_LEVELS; i++) {
+        key = r300_mix64(key, ((uint64_t)u->loff[i] << 32) | u->lpitch[i]);
+        key = r300_mix64(key, ((uint64_t)u->lw[i] << 32) | (uint32_t)u->lh[i]);
+    }
+    for (i = 0; i < q->shadow_dw[unit]; i++) {
+        hash = r300_mix64(hash, q->shadow[unit][i]);
+    }
+    for (k = 0; k < R300_GL_BTEX; k++) {
+        if (s->gl_btex[k].live && s->gl_btex[k].key == key &&
+            s->gl_btex[k].hash == hash && s->gl_btex[k].sz >= need) {
+            s->gl_btex[k].used = ++s->gl_btex_seq;
+            s->gl_btex_hit++;
+            q->shadowed[unit] = false;
+            return s->gl_btex[k].rgba;
+        }
+        if (!s->gl_btex[k].live) {
+            victim = k;
+        } else if (s->gl_btex[victim].live &&
+                   s->gl_btex[k].used < s->gl_btex[victim].used) {
+            victim = k;
+        }
+    }
+    s->gl_btex_miss++;
+    if (s->gl_btex[victim].sz < need) {
+        s->gl_btex[victim].rgba = g_realloc(s->gl_btex[victim].rgba, need);
+        s->gl_btex[victim].sz = need;
+    }
+    r300_gl_decode_tex(s, d, unit, s->gl_btex[victim].rgba);
+    q->shadowed[unit] = false;
+    s->gl_btex[victim].key = key;
+    s->gl_btex[victim].hash = hash;
+    s->gl_btex[victim].used = ++s->gl_btex_seq;
+    s->gl_btex[victim].live = true;
+    return s->gl_btex[victim].rgba;
+}
+
+static void r300_gl_decode_tex_fast(ATIR350State *s, const R300DrawState *d,
+                                    unsigned unit, uint8_t *rgba)
+{
+    bool sh = r300_gl_shadow_bus(s, d, unit);
+
+    r300_gl_decode_tex(s, d, unit, rgba);
+    if (sh) {
+        s->raster->shadowed[unit] = false;
+    }
 }
 
 /*
@@ -7366,9 +8041,18 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
         (uint64_t)off + len > ATI_R350_VRAM_SIZE ||
         r300_gl_pages(s, off, len) > R300_GL_DIRTY_PAGES ||
         !r300_cap_xor(s, off, len, &xr)) {
+        const uint8_t *b = NULL;
+
+        /* in AGP/PCI memory: the content-keyed cache */
+        if (!ati_r350_mc_to_vram(s, u->off, &off)) {
+            b = r300_gl_btex(s, d, unit);
+        }
+        if (b) {
+            return b;
+        }
         s->gl_tex_miss++;
-        r300_gl_decode_tex(s, d, unit, s->gl_texbuf);
-        return s->gl_texbuf;
+        r300_gl_decode_tex_fast(s, d, unit, s->gl_texbuf[unit]);
+        return s->gl_texbuf[unit];
     }
     for (k = 0; k < R300_GL_TEXCACHE; k++) {
         /*
@@ -7410,7 +8094,7 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
         s->gl_tex[victim].rgba = g_realloc(s->gl_tex[victim].rgba, need);
         s->gl_tex[victim].sz = need;
     }
-    r300_gl_decode_tex(s, d, unit, s->gl_tex[victim].rgba);
+    r300_gl_decode_tex_fast(s, d, unit, s->gl_tex[victim].rgba);
     s->gl_tex[victim].off = off;
     s->gl_tex[victim].len = len;
     s->gl_tex[victim].pitch = u->pitch;
@@ -7498,6 +8182,12 @@ static void r300_gl_vtx(float *v, const R300Vtx *me, const R300Vtx *t0,
     /* the depth test's: screen-linear Z, and which face the stencil uses */
     v[41 + 8 * C] = t0->z; v[42 + 8 * C] = t1->z; v[43 + 8 * C] = t2->z;
     v[44 + 8 * C] = back ? 1.0f : 0.0f;
+    for (k = 0; k < R350_GL_RAWSETS; k++) {
+        v[45 + 8 * C + 4 * k] = me->tcr[k][0];
+        v[46 + 8 * C + 4 * k] = me->tcr[k][1];
+        v[47 + 8 * C + 4 * k] = me->tcr[k][2];
+        v[48 + 8 * C + 4 * k] = me->tcr[k][3];
+    }
 }
 
 /*
@@ -7627,13 +8317,61 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     if (d->resolve) {
         return r300_gl_fallback(s, R350_GLF_RESOLVE, prim, nvtx);
     }
+    /* an occlusion query counts samples; only the software path does */
+    if (s->zq_active) {
+        return r300_gl_fallback(s, R350_GLF_ZTEST, prim, nvtx);
+    }
     /*
      * A fragment program the translator refused. The software path runs
      * the same refusal through the interpreter and paints the
      * interpolated colour; sending this draw to a shader that computes
      * something else would be the one thing worse than either.
      */
+    /*
+     * Cube maps: Metal samples their faces only from a program that
+     * fetches inside itself (the general path); anything else -- and
+     * the GL backend -- leaves them to the software path.
+     */
+    bool cube_gen = false;
+
+    for (i = 0; shade && i < R300_TEX_UNITS; i++) {
+        if (d->tex[i].en && d->tex[i].cube) {
+            if (!(s->gl_api && !strcmp(s->gl_api, "metal") && d->fs &&
+                  d->fs->gl_general && s->us_glsl_ok &&
+                  (!d->fs->gl_multi || s->us_glsl_gen_ok))) {
+                s->us_grefuse[3]++;
+                return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
+            }
+            /* a two-texture program: run its general translation */
+            cube_gen = d->fs->gl_multi;
+            break;
+        }
+    }
     if (shade && (!d->fs_run || !s->us_glsl_ok)) {
+        const R300UsProgram *p = d->fs;
+
+        if (!d->fs_run || !p || !p->valid || !p->expressible) {
+            s->us_refuse[0]++;
+        } else {
+            unsigned k, nf = 0, kill = 0, other_unit = 0;
+
+            for (k = 0; k < p->ntex && k < R300_US_TEX_SLOTS; k++) {
+                if (p->tex[k].op == R300_US_TEXOP_TEXKILL) {
+                    kill = 1;
+                } else if (p->tex[k].op != R300_US_TEXOP_NOP) {
+                    nf++;
+                    s->us_refuse_units |= 1u << (p->tex[k].unit & 31);
+                    other_unit |= p->tex[k].unit != 0;
+                }
+            }
+            s->us_refuse[1] += p->nlevels > 1;
+            s->us_refuse[2] += kill;
+            s->us_refuse[3] += nf > 1;
+            s->us_refuse[4] += other_unit;
+            s->us_refuse[5] += !(p->nlevels > 1 || kill || nf > 1 ||
+                                 other_unit);
+            s->us_grefuse[p->gl_gwhy < 3 ? p->gl_gwhy : 0]++;
+        }
         return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
     }
     if (!shade && !gpuz) {
@@ -7743,7 +8481,17 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
      * the draw capture uses -- the bounding box widened by a pixel and
      * clipped exactly the way r300_raster_tri() clips its scan.
      */
-    if (d->cb_bpp != 4 || d->cb_host) {
+    /*
+     * 16bpp targets render on the zero-copy GPU too: Quake 3 (10.4)
+     * draws its whole frame into an ARGB1555 buffer, and refusing it
+     * sent every frame to the software rasterizer.
+     */
+    if (d->cb_host ||
+        !(d->cb_bpp == 4 ||
+          (d->cb_bpp == 2 && s->gl_direct &&
+           (d->cb_fmt == R300_COLORFORMAT_ARGB1555 ||
+            d->cb_fmt == R300_COLORFORMAT_RGB565 ||
+            d->cb_fmt == R300_COLORFORMAT_ARGB4444)))) {
         return r300_gl_fallback(s, R350_GLF_CBFMT, prim, nvtx);
     }
     if ((d->dst_off | d->dst_pitch) & 3) {
@@ -7764,7 +8512,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
          *
          * The other two keep the release. "Off-screen" and "not finite"
          * arrive here together, and only the clipped-to-empty half of
-         * that pair is provable: a coordinate outside +-100000 is a
+         * that pair is provable: a coordinate outside +-1e6 is a
          * draw this helper declined to reason about, not one that
          * misses the screen, and the rasterizer will happily scan it.
          */
@@ -7813,9 +8561,13 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         s->gl_sw = g_realloc(s->gl_sw, rect_sz);
         s->gl_rect_sz = rect_sz;
     }
-    if (texels * 4 > s->gl_texbuf_sz) {
-        s->gl_texbuf = g_realloc(s->gl_texbuf, texels * 4);
-        s->gl_texbuf_sz = texels * 4;
+    QEMU_BUILD_BUG_ON(sizeof(s->gl_texbuf) / sizeof(s->gl_texbuf[0]) <
+                      R300_TEX_UNITS);
+    for (i = 0; i < R300_TEX_UNITS; i++) {
+        if (d->tex[i].en && shade && texels * 4 > s->gl_texbuf_sz[i]) {
+            s->gl_texbuf[i] = g_realloc(s->gl_texbuf[i], texels * 4);
+            s->gl_texbuf_sz[i] = texels * 4;
+        }
     }
     if ((size_t)ntri * 3 * R350_GL_VSTRIDE * sizeof(float) > s->gl_verts_sz) {
         s->gl_verts_sz = (size_t)ntri * 3 * R350_GL_VSTRIDE * sizeof(float);
@@ -7878,6 +8630,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         req.cb_off = d->dst_off;
         req.cb_pitch = d->dst_pitch;
         req.cb_xr = xr;
+        req.cb_fmt = d->cb_bpp == 2 ? d->cb_fmt : 0;
         req.z_off = s->zb.off;
         req.z_pitch = s->zb.pitch;
         req.z_macro = s->zb.macro;
@@ -7897,11 +8650,64 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         req.tex_slot[i] = texslot[i];
         req.tex_fresh[i] = texfresh[i];
         req.tex_w[i] = d->tex[i].w;
-        req.tex_h[i] = d->tex[i].h;
+        req.tex_h[i] = d->tex[i].h * (d->tex[i].cube ? 6 : 1);
         req.clamp_s[i] = d->tex[i].clamp_s;
         req.clamp_t[i] = d->tex[i].clamp_t;
         r300_gl_filt(&d->tex[i], &req, i);
         req.textured |= d->tex[i].en ? (1u << i) : 0;
+    }
+    /*
+     * The backend samples the program's fetches in front of it: the
+     * first fetch's unit at its index 0, the second's (Metal only) at
+     * index 1. Move the units there -- JK2 draws with only unit 1
+     * enabled, and its lightmapped world fetches units 0 AND 1.
+     */
+    if (shade && d->fs && d->fs->gl_nfetch) {
+        const R350GlReq src = req;
+        unsigned map[4], nf, f;
+
+        if (d->fs->gl_multi && !cube_gen) {
+            nf = MIN(d->fs->gl_nfetch, 4u);
+            for (f = 0; f < nf; f++) {
+                map[f] = MIN(d->fs->gl_funit[f], R300_TEX_UNITS - 1u);
+            }
+        } else if (d->fs->gl_general) {
+            /* the program's units, packed into bindings 0-3 */
+            nf = 4;
+            for (f = 0; f < nf; f++) {
+                map[f] = f < d->fs->gl_ngen ? d->fs->gl_gunit[f] : f;
+            }
+        } else {
+            nf = 1;
+            map[0] = MIN(d->fs->gl_unit, R300_TEX_UNITS - 1u);
+        }
+
+        req.textured = 0;
+        for (f = 0; f < nf; f++) {
+            unsigned u = map[f];
+
+            req.tex[f] = src.tex[u];
+            req.tex_slot[f] = src.tex_slot[u];
+            req.tex_fresh[f] = src.tex_fresh[u];
+            req.tex_w[f] = src.tex_w[u];
+            req.tex_h[f] = src.tex_h[u];
+            req.clamp_s[f] = src.clamp_s[u];
+            req.clamp_t[f] = src.clamp_t[u];
+            memcpy(req.filt[f], src.filt[u], sizeof(req.filt[f]));
+            req.levels[f] = src.levels[u];
+            memcpy(req.border[f], src.border[u], sizeof(req.border[f]));
+            req.textured |= ((src.textured >> u) & 1) << f;
+        }
+    }
+    {
+        unsigned n;
+
+        for (n = 0; n < 4; n++) {
+            const R300TexUnit *tu = &d->tex[d->tc_unit[n] & 7];
+
+            req.set_inv[n][0] = tu->w ? 1.0f / (float)tu->w : 1.0f;
+            req.set_inv[n][1] = tu->h ? 1.0f / (float)tu->h : 1.0f;
+        }
     }
     req.wmask = d->wmask;
     req.alpha_test = d->alpha_test;
@@ -7920,8 +8726,9 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.k_b = d->k_b; req.k_a = d->k_a;
     /* only verify wants the pixels on the host; see the coherency block */
     req.out = s->gl_mode == R350_GL_VERIFY ? s->gl_out : NULL;
-    req.us_glsl = s->us_glsl;
-    req.us_key = s->us_glsl_key;
+    req.us_glsl = cube_gen ? s->us_glsl_gen : s->us_glsl;
+    req.us_key = cube_gen ? s->us_glsl_gen_key : s->us_glsl_key;
+    req.tc_raw = d->tc_raw;
     req.us_konst = s->us_konst_flat;
     if (!shade) {
         /*
@@ -7930,8 +8737,13 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
          * program, no texture, no test, and a write mask that keeps
          * every colour byte as it was.
          */
-        req.us_glsl = r300_gl_zonly_us;
-        req.us_key = R300_GL_ZONLY_KEY;
+        if (s->gl_api && !strcmp(s->gl_api, "metal")) {
+            req.us_glsl = r300_gl_zonly_us_multi;
+            req.us_key = R300_GL_ZONLY_KEY_MULTI;
+        } else {
+            req.us_glsl = r300_gl_zonly_us;
+            req.us_key = R300_GL_ZONLY_KEY;
+        }
         req.alpha_test = 0;
         req.discard = 0;
         req.blend = 0;
@@ -8085,9 +8897,263 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
     qemu_rec_mutex_unlock(&s->gl_tex_lock);
 }
 
+/*
+ * NEAR-PLANE CLIPPING. The R300 VAP clips every primitive against the
+ * view volume before the divide (VAP_CLIP_CNTL); this model did not,
+ * so a triangle with a corner level with or behind the eye was drawn
+ * through that corner's mirrored or parked (-32768) position -- huge
+ * shards across the screen. Nothing the desktop or Chess draws reaches
+ * behind the eye; Quake 3's world does on every frame.
+ *
+ * Triangle lists only (prim 4, Quake 3's world): each triangle with a
+ * corner at w < R300_CLIP_W is cut to its visible part in clip space
+ * (Sutherland-Hodgman against the single plane w = R300_CLIP_W), every
+ * attribute of a new corner interpolated linearly there -- correct for
+ * attributes the rasterizer then interpolates perspective-correctly --
+ * and the corner mapped to the screen by r300_xform_vtx() exactly as a
+ * fetched one is. The corner order is kept, so facing and culling are
+ * what they were. Returns the new vertex count; *out is g_free()'s.
+ */
+#define R300_CLIP_W 1e-3f
+/*
+ * VAP_CLIP_CNTL: CLIP_DISABLE (bit 16) turns the clipper off -- the
+ * desktop's draws set it (0x1c000); Quake 3's leave the register 0, so
+ * the near plane is OpenGL's z = -w, or z = 0 under DX_CLIP_SPACE_DEF
+ * (bit 22). Cutting at the real plane rather than at w = R300_CLIP_W
+ * matters: a corner at w = 0.001 lands ~1e5 pixels away, which the GL
+ * offload refuses as an unplaceable rectangle (R350_GLF_RECT).
+ */
+#define R300_VAP_CLIP_CNTL      0x221c
+#define R300_CLIP_DISABLE       (1u << 16)
+#define R300_DX_CLIP_SPACE_DEF  (1u << 22)
+
+static inline float r300_near_d(bool dx, const R300Vtx *v)
+{
+    return dx ? v->clip[2] : v->clip[2] + v->clip[3];
+}
+
+/* inside the near plane, allowing for rounding on a vertex lying on it */
+static inline bool r300_near_in(bool dx, const R300Vtx *v)
+{
+    return v->clip[3] >= R300_CLIP_W &&
+           r300_near_d(dx, v) >= -1e-5f * MAX(1.0f, fabsf(v->clip[3]));
+}
+
+static void r300_lerp_vtx(R300Vtx *o, const R300Vtx *a, const R300Vtx *b,
+                          float t)
+{
+    const float *pa = (const float *)a, *pb = (const float *)b;
+    float *po = (float *)o;
+    size_t i;
+
+    QEMU_BUILD_BUG_ON(sizeof(R300Vtx) % sizeof(float));
+    for (i = 0; i < sizeof(R300Vtx) / sizeof(float); i++) {
+        po[i] = pa[i] + (pb[i] - pa[i]) * t;
+    }
+}
+
+/*
+ * The guard band, in clip space: |x| and |y| at most R300_GUARD * w.
+ * A corner a few hundred thousand pixels off screen is legal for the
+ * real chip but past what r300_cap_rect() places (+-1e6), so a draw
+ * whose triangle merely passes close beside the eye went to the
+ * software rasterizer -- Halo's terrain and walls, thousands a second,
+ * each filling most of the screen. Cutting at 64 viewports from the
+ * centre changes no pixel: everything removed lies outside the scissor.
+ */
+#define R300_GUARD 64.0f
+
+static inline float r300_plane_d(bool dx, unsigned pl, const R300Vtx *v)
+{
+    switch (pl) {
+    case 0: return r300_near_d(dx, v);
+    case 1: return R300_GUARD * v->clip[3] - v->clip[0];
+    case 2: return R300_GUARD * v->clip[3] + v->clip[0];
+    case 3: return R300_GUARD * v->clip[3] - v->clip[1];
+    default: return R300_GUARD * v->clip[3] + v->clip[1];
+    }
+}
+
+static inline bool r300_plane_in(bool dx, unsigned pl, const R300Vtx *v)
+{
+    if (pl == 0) {
+        return r300_near_in(dx, v);
+    }
+    return r300_plane_d(dx, pl, v) >= 0.0f;
+}
+
+/* inside the guard band (only meaningful in front of the eye) */
+static inline bool r300_guard_in(const R300Vtx *v)
+{
+    float g = R300_GUARD * v->clip[3];
+
+    return v->clip[3] > 0.0f && fabsf(v->clip[0]) <= g &&
+           fabsf(v->clip[1]) <= g;
+}
+
+static unsigned r300_clip_tris(const ATIR350State *s, const R300DrawState *d,
+                               const R300Vtx *vb, unsigned nvtx, bool near,
+                               R300Vtx **out)
+{
+    bool dx = s->regs[R300_VAP_CLIP_CNTL >> 2] & R300_DX_CLIP_SPACE_DEF;
+    /* a triangle cut by five planes is at most 8 corners: 6 triangles */
+    R300Vtx *o = g_new(R300Vtx, (size_t)(nvtx / 3) * 18);
+    unsigned n = 0, t, i;
+
+    for (t = 0; t + 3 <= nvtx; t += 3) {
+        R300Vtx pa[9], pb[9];
+        R300Vtx *in = pa, *op = pb, *sw;
+        unsigned np = 3, pl, k;
+
+        in[0] = vb[t];
+        in[1] = vb[t + 1];
+        in[2] = vb[t + 2];
+        for (pl = near ? 0 : 1; pl < 5 && np >= 3; pl++) {
+            unsigned no = 0;
+            bool any_out = false;
+
+            for (i = 0; i < np; i++) {
+                any_out |= !r300_plane_in(dx, pl, &in[i]);
+            }
+            if (!any_out) {
+                continue;
+            }
+            for (i = 0; i < np && no < 8; i++) {
+                const R300Vtx *a = &in[i], *b = &in[(i + 1) % np];
+                bool ain = r300_plane_in(dx, pl, a);
+                bool bin = r300_plane_in(dx, pl, b);
+
+                if (ain) {
+                    op[no++] = *a;
+                }
+                if (ain != bin && no < 8) {
+                    float da = r300_plane_d(dx, pl, a);
+                    float db = r300_plane_d(dx, pl, b);
+                    float tt = da / (da - db);
+                    R300Vtx *nv = &op[no++];
+
+                    tt = isfinite(tt) ? MIN(MAX(tt, 0.0f), 1.0f) : 0.5f;
+                    r300_lerp_vtx(nv, a, b, tt);
+                    r300_xform_vtx(s, d, nv, nv->clip);
+                }
+            }
+            np = no;
+            sw = in;
+            in = op;
+            op = sw;
+        }
+        /* a fan over the visible polygon, corner order (facing) kept */
+        for (k = 1; np >= 3 && k + 1 < np; k++) {
+            o[n++] = in[0];
+            o[n++] = in[k];
+            o[n++] = in[k + 1];
+        }
+    }
+    *out = o;
+    return n;
+}
+
+static void r300_run_prims_body(ATIR350State *s, R300DrawState *d,
+                                const R300Vtx *vb, unsigned nvtx,
+                                unsigned prim);
+
 static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
                                   const R300Vtx *vb, unsigned nvtx,
                                   unsigned prim)
+{
+    if ((prim == 4 || prim == 5 || prim == 6 || prim == 13 || prim == 14 ||
+         prim == 15) && d->xform && nvtx >= 3) {
+        bool dx = s->regs[R300_VAP_CLIP_CNTL >> 2] & R300_DX_CLIP_SPACE_DEF;
+        bool near = !(s->regs[R300_VAP_CLIP_CNTL >> 2] & R300_CLIP_DISABLE);
+        unsigned i;
+
+        for (i = 0; i < nvtx; i++) {
+            /*
+             * Behind the near plane by more than rounding, or (in front
+             * of the eye) outside the guard band.
+             */
+            if ((near && !r300_near_in(dx, &vb[i])) ||
+                (vb[i].clip[3] > 0.0f && !r300_guard_in(&vb[i]))) {
+                g_autofree R300Vtx *cv = NULL;
+                g_autofree R300Vtx *tl = NULL;
+                const R300Vtx *lv = vb;
+                unsigned nl = nvtx - nvtx % 3, n;
+
+                /*
+                 * Strips, fans, quads and polygons are assembled into a
+                 * plain triangle list first -- with each triangle wound
+                 * the way r300_run_prims_body() would have faced it --
+                 * so the clipper sees them too. JK2's (and Quake 3's)
+                 * skybox is glBegin(GL_TRIANGLE_STRIP) rows sent as
+                 * DRAW_IMMD_2 strips; the box surrounds the eye, and
+                 * the unclipped triangles reaching behind it vanished,
+                 * leaving straight-edged holes in the sky.
+                 */
+                if (prim != 4) {
+                    unsigned k = 0;
+
+                    tl = g_new(R300Vtx, (size_t)nvtx * 3);
+                    switch (prim) {
+                    case 5:
+                    case 15:
+                        for (k = 2; k < nvtx; k++) {
+                            tl[(k - 2) * 3] = vb[0];
+                            tl[(k - 2) * 3 + 1] = vb[k - 1];
+                            tl[(k - 2) * 3 + 2] = vb[k];
+                        }
+                        nl = (nvtx - 2) * 3;
+                        break;
+                    case 6:
+                        for (k = 2; k < nvtx; k++) {
+                            bool odd = k & 1;
+
+                            tl[(k - 2) * 3] = vb[odd ? k - 1 : k - 2];
+                            tl[(k - 2) * 3 + 1] = vb[odd ? k - 2 : k - 1];
+                            tl[(k - 2) * 3 + 2] = vb[k];
+                        }
+                        nl = (nvtx - 2) * 3;
+                        break;
+                    case 14:
+                        nl = 0;
+                        for (k = 2; k + 2 <= nvtx; k += 2) {
+                            tl[nl++] = vb[k - 2];
+                            tl[nl++] = vb[k - 1];
+                            tl[nl++] = vb[k + 1];
+                            tl[nl++] = vb[k - 2];
+                            tl[nl++] = vb[k + 1];
+                            tl[nl++] = vb[k];
+                        }
+                        break;
+                    case 13:
+                        nl = 0;
+                        for (k = 0; k + 4 <= nvtx; k += 4) {
+                            tl[nl++] = vb[k];
+                            tl[nl++] = vb[k + 1];
+                            tl[nl++] = vb[k + 2];
+                            tl[nl++] = vb[k];
+                            tl[nl++] = vb[k + 2];
+                            tl[nl++] = vb[k + 3];
+                        }
+                        break;
+                    }
+                    lv = tl;
+                }
+                n = r300_clip_tris(s, d, lv, nl, near, &cv);
+
+                s->r300_clipped_draws++;
+                if (n) {
+                    r300_run_prims_body(s, d, cv, n, 4);
+                }
+                return;
+            }
+        }
+    }
+    r300_run_prims_body(s, d, vb, nvtx, prim);
+}
+
+static void r300_run_prims_body(ATIR350State *s, R300DrawState *d,
+                                const R300Vtx *vb, unsigned nvtx,
+                                unsigned prim)
 {
     if (nvtx && trace_event_get_state_backends(TRACE_ATI_R350_3D_RECT)) {
         r300_trace_rect(s, d, vb, nvtx, prim);
@@ -8122,8 +9188,11 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
     }
     if (s->gl_ctx && nvtx &&
         (d->wmask || (s->zb.z_en && ati_r350_gl_depth(s->gl_ctx)))) {
+        int64_t t0 = get_clock();
         R300GlOutcome o = r300_gl_prims(s, d, vb, nvtx, prim);
 
+        s->gpu_prep_ns += get_clock() - t0;
+        s->gpu_prep_n++;
         if (o == R300_GL_DRAWN) {
             /*
              * The backend rendered the colour. Without a depth buffer of
@@ -8152,11 +9221,17 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
     }
     /* the software rasterizer writes VRAM the GPU copy shadows */
     ati_r350_gl_release(s, R350_GLR_FALLBACK);
-    if (d->cb_host) {
-        r300_raster_gart(s, d, vb, nvtx, prim);
-        return;
+    {
+        int64_t t0 = get_clock();
+
+        if (d->cb_host) {
+            r300_raster_gart(s, d, vb, nvtx, prim);
+        } else {
+            r300_raster_prims(s, d, vb, nvtx, prim);
+        }
+        s->sw_draw_ns += get_clock() - t0;
+        s->sw_draw_n++;
     }
-    r300_raster_prims(s, d, vb, nvtx, prim);
 }
 
 /*
@@ -8164,6 +9239,54 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
  * vertex count), the rest is vertex data laid out VAP_VTX_SIZE dwords
  * per vertex.
  */
+/*
+ * regtrace-width=0: start the trace when a GAME starts drawing, with a
+ * snapshot of every register as it stands -- no monitor, no second
+ * terminal. Two signs, either one: an interleaved vertex array (a
+ * Quake 3-engine frame; see r300_draw_aos), or a draw with a texture
+ * in a format Tiger's compositor never uses. The desktop samples only
+ * 8888 (code 0x0c) and X8 (code 0x00) textures; Halo's DXT, 16-bit and
+ * luminance-alpha textures are none of those.
+ */
+static void r300_rt_arm(ATIR350State *s, const char *why)
+{
+    unsigned r;
+
+    if (!s->rt_path || s->rt_width || s->rt_armed || s->rt_done) {
+        return;
+    }
+    s->rt_armed = true;
+    ati_r350_rt_printf(s, "# armed at %s; register snapshot follows\n", why);
+    for (r = 0; r < ATI_R350_NUM_REGS; r++) {
+        if (s->regs[r]) {
+            ati_r350_rt_printf(s, "S %04x %-28s %08x\n", r * 4,
+                               ati_r350_reg_name(r * 4), s->regs[r]);
+        }
+    }
+    ati_r350_rt_printf(s, "# snapshot end\n");
+}
+
+static void r300_rt_arm_game(ATIR350State *s)
+{
+    uint32_t en;
+    unsigned u;
+
+    if (!s->rt_path || s->rt_width || s->rt_armed || s->rt_done) {
+        return;
+    }
+    en = s->regs[R300_TX_ENABLE >> 2] & 0xffff;
+    for (u = 0; u < 16 && en; u++, en >>= 1) {
+        unsigned code = s->regs[(R300_TX_FORMAT1_0 >> 2) + u] &
+                        R300_TX_FORMAT1_CODE_MASK;
+
+        if ((en & 1) && code != 0x00 && code != 0x0c) {
+            r300_rt_arm(s, "the first draw with a non-desktop texture "
+                        "format");
+            return;
+        }
+    }
+}
+
 void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
 {
     uint32_t vf = dw[0];
@@ -8172,6 +9295,8 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
     unsigned nvtx = (vf >> 16) & 0xffff;
     unsigned vsize = s->regs[R300_VAP_VTX_SIZE >> 2] & 0x7f;
     R300DrawState d;
+
+    r300_rt_arm_game(s);
     R300VtxFmt fmt = { 0 };
     unsigned i;
 
@@ -8299,6 +9424,7 @@ typedef struct R300AosCtx {
     const R300TexSrc *ts;
     const unsigned *list;       /* indices to shade, or NULL: base + k */
     unsigned n, base;
+    unsigned pos;               /* dwords in the POSITION element */
     R300Vtx *out;               /* indexed by vertex index */
 } R300AosCtx;
 
@@ -8359,10 +9485,80 @@ static void r300_aos_load(const R300AosCtx *cx, unsigned vi, R300Vtx *v,
                 n > base + 3 ? dw[base + 3] : 0);
         }
     }
-    r300_load_vtx(d, cx->fmt, dw, cx->vsize, cx->size[0], v);
+    r300_load_vtx(d, cx->fmt, dw, cx->vsize, cx->pos, v);
     r300_attr_texcoord(d, cx->fmt, dw, cx->ts, v);
     if (first && d->textured) {
         r300_trace_texcoord(d, cx->fmt, dw, v);
+    }
+}
+
+static uint32_t r300_fbits(float f)
+{
+    uint32_t u;
+
+    memcpy(&u, &f, 4);
+    return u;
+}
+
+/*
+ * DIAG (Quake 3 bring-up): per draw, what the vertex stage made of the
+ * first vertex; and whenever the vertex program or its position matrix
+ * changes, the program's instructions, constants 0-15 and the matrix the
+ * fixed path would use. Off unless the ati_r350_3d_vs* events are on.
+ */
+static void r300_vs_diag(ATIR350State *s, const R300DrawState *d,
+                         const uint32_t *dw, bool ran, const float *clip,
+                         const R300Vtx *v)
+{
+    static uint64_t last_sig;
+    const R300PvsProgram *p = &d->vs;
+    uint64_t sig = p->first | (uint64_t)p->last << 10 |
+                   (uint64_t)p->cbase << 20 | (uint64_t)p->valid << 30 |
+                   (uint64_t)p->plain_matrix << 31;
+    unsigned i;
+
+    if (p->code && p->last >= p->first && p->last - p->first < 64) {
+        for (i = p->first * 4; i <= p->last * 4 + 3; i++) {
+            sig = sig * 1000003u + p->code[i];
+        }
+    }
+    for (i = 0; i < 16; i++) {
+        sig = sig * 1000003u + r300_fbits(d->mat[i]);
+    }
+    ati_r350_rt_printf(s, "VS valid=%d run=%d plain=%d ran=%d xform=%d "
+                       "inst=%u..%u cbase=%u out=0x%x vte_fmt=0x%x "
+                       "in=(%g,%g,%g) clip=(%g,%g,%g,%g) out=(%g,%g)\n",
+                       p->valid, d->vs_run, p->plain_matrix, ran, d->xform,
+                       p->first, p->last, p->cbase, p->out_mask,
+                       s->zb.vte_fmt, r300_f32(dw[0]), r300_f32(dw[1]),
+                       r300_f32(dw[2]), clip[0], clip[1], clip[2], clip[3],
+                       v->x, v->y);
+    if (sig == last_sig) {
+        return;
+    }
+    last_sig = sig;
+    for (i = 0; i < 4; i++) {
+        ati_r350_rt_printf(s, "VSMAT row%u %g %g %g %g\n", i,
+                           d->mat[i * 4], d->mat[i * 4 + 1],
+                           d->mat[i * 4 + 2], d->mat[i * 4 + 3]);
+    }
+    ati_r350_rt_printf(s, "VSVPORT %g %g %g %g\n", d->vp[0], d->vp[1],
+                       d->vp[2], d->vp[3]);
+    if (p->cnst) {
+        for (i = 0; i < 16; i++) {
+            float c[4];
+
+            r300_pvs_const(p, i, c);
+            ati_r350_rt_printf(s, "VSCONST c%u %g %g %g %g\n", i,
+                               c[0], c[1], c[2], c[3]);
+        }
+    }
+    if (p->code && p->last >= p->first) {
+        for (i = p->first; i <= p->last && i < p->first + 64; i++) {
+            ati_r350_rt_printf(s, "VSINST %u %08x %08x %08x %08x\n", i,
+                               p->code[i * 4], p->code[i * 4 + 1],
+                               p->code[i * 4 + 2], p->code[i * 4 + 3]);
+        }
     }
 }
 
@@ -8372,16 +9568,19 @@ static void r300_aos_one(const R300AosCtx *cx, unsigned vi, R300Vtx *v,
     ATIR350State *s = cx->s;
     R300DrawState *d = cx->d;
 
-    r300_aos_load(cx, vi, v, first, dw);
-    if (d->vs_run) {
-        float clip[4];
+    float clip[4] = { 0 };
+    bool ran = false;
 
-        if (r300_vs_vtx(s, d, cx->fmt, dw, v, clip)) {
-            r300_xform_vtx(s, d, v, clip);
-            return;
-        }
+    r300_aos_load(cx, vi, v, first, dw);
+    if (d->vs_run && r300_vs_vtx(s, d, cx->fmt, dw, v, clip)) {
+        ran = true;
+        r300_xform_vtx(s, d, v, clip);
+    } else {
+        r300_xform_vtx(s, d, v, NULL);
     }
-    r300_xform_vtx(s, d, v, NULL);
+    if (first && ati_r350_rt_on(s)) {
+        r300_vs_diag(s, d, dw, ran, clip, v);
+    }
 }
 
 /*
@@ -8483,7 +9682,7 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
     unsigned swap = s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_VC_SWAP;
     R300DrawState d;
     R300VtxFmt fmt = { 0 };
-    unsigned i, a;
+    unsigned i, a, pos0;
 
     if (narr > R300_AOS_MAX) {
         ati_r350_note_gap(s, R350_GAP_AOS_ARRAYS, narr);
@@ -8523,10 +9722,48 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
         trace_ati_r350_3d_skip(vf, vsize, nvtx);
         return;
     }
+    r300_rt_arm_game(s);
+    /*
+     * regtrace-tail: the game's 3D world draws lightmapped surfaces with
+     * two texture units; its menus use one.  Once a two-unit draw has
+     * been seen, 20000 draws without one means the game (or timedemo)
+     * has ended -- stop there so the menu cannot roll the game out of
+     * the kept tail.
+     */
+    if (s->rt_tail && ati_r350_rt_on(s)) {
+        uint32_t txen = s->regs[R300_TX_ENABLE >> 2] & 0xffff;
+
+        /* two or more units: JK2's menus enable unit 1 ALONE */
+        if (txen & (txen - 1)) {
+            if (!s->rt_mt) {
+                ati_r350_rt_printf(s, "# first multitexture draw\n");
+            }
+            s->rt_mt = true;
+            s->rt_quiet = 0;
+        } else if (s->rt_mt && ++s->rt_quiet > 20000) {
+            ati_r350_rt_stop(s, "20000 draws without multitexture "
+                             "(game ended)");
+        }
+    }
+    s->r300_aos_wide = false;
+    for (a = 0; a < narr; a++) {
+        if (size[a] > 4) {
+            s->r300_aos_wide = true;
+            /*
+             * regtrace-width=0: start the trace at the first draw from
+             * an interleaved array -- a Quake 3-engine game's first
+             * frame; the desktop never sends one -- with a snapshot of
+             * every register as it stands.
+             */
+            r300_rt_arm(s, "the first interleaved draw");
+        }
+    }
     if (!r300_setup_draw(s, &d, vsize)) {
+        s->r300_aos_wide = false;
         trace_ati_r350_3d_skip(vf, vsize, s->regs[R300_RB3D_COLOROFFSET0 >> 2]);
         return;
     }
+    s->r300_aos_wide = false;
 
     trace_ati_r350_3d_draw(prim, nvtx, vsize, d.dst_off, d.dst_pitch,
                            d.textured, d.blend, d.tex[0].off);
@@ -8546,7 +9783,35 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
      * answer. (The whole packed-colour family reaches the fetch through
      * here, and reaches it with the arrays and the registers agreeing.)
      */
-    r300_stream_route(s, d.attr_size, &d.attr_count, 0, &fmt);
+    /*
+     * INTERLEAVED ARRAYS. An array wider than four dwords cannot be one
+     * input register, so it is several elements packed side by side and
+     * the stream control is what splits it -- the VAP consumes the
+     * fetched dwords element by element, not array by array. Quake 3 on
+     * Mac OS X 10.4 binds exactly one: AOS 0x606 (6 dwords, stride 6)
+     * with PROG_STREAM_CNTL 0x81048002/0x8000a201, FLOAT_3 position +
+     * UNSIGNED_BYTE colour + FLOAT_2 coordinate. Refusing the registers
+     * there (one array vs three elements) read all six dwords as the
+     * position, so w was the packed colour: 0xff000000 as a float sent
+     * every menu vertex to (0,0) and the world's to NaN. Hand the router
+     * the vertex's total as its guess for such a draw; it still takes
+     * the registers only when they account for every dword and end on
+     * LAST_VEC, which the stale all-zero reset value never does.
+     */
+    {
+        bool wide = false;
+
+        for (a = 0; a < narr; a++) {
+            if (size[a] > 4) {
+                wide = true;
+            }
+        }
+        r300_stream_route(s, d.attr_size, &d.attr_count, wide ? vsize : 0,
+                          &fmt);
+    }
+    /* the position element's own width; the array's when not routed */
+    pos0 = d.attr_count && d.attr_size[0] ? MIN(d.attr_size[0], 4u)
+                                          : size[0];
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
@@ -8605,12 +9870,12 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
                 }
             }
         }
-        r300_texcoord_src(&d, vsize, size[0], ts);
+        r300_texcoord_src(&d, vsize, pos0, ts);
         {
             R300AosCtx cx = {
                 .s = s, .d = &d, .fmt = &fmt, .narr = narr, .vsize = vsize,
                 .swap = swap, .addr = addr, .size = size, .stride = stride,
-                .arr = arr, .vp = vp, .vxr = vxr, .ts = ts,
+                .arr = arr, .vp = vp, .vxr = vxr, .ts = ts, .pos = pos0,
             };
             g_autofree R300Vtx *ub = NULL;
             g_autofree unsigned *list = NULL;

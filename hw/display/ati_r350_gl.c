@@ -1513,11 +1513,16 @@ R350GlCtx *ati_r350_gl_open(const char **err)
          */
         const int C = R350_GL_TEXCOORDS;
         const struct { GLint loc, n, off; } at[] = {
-            { 0, 2, 0 }, { 1, 4, 2 }, { 2, 2 * C, 6 },
+            /*
+             * A GL attribute is at most four floats: the coordinate
+             * blocks carry 2*C, of which this backend reads set 0 (and
+             * at most set 1), so it binds the first four of each.
+             */
+            { 0, 2, 0 }, { 1, 4, 2 }, { 2, MIN(2 * C, 4), 6 },
             { 3, 2, 6 + 2 * C }, { 4, 2, 8 + 2 * C }, { 5, 2, 10 + 2 * C },
             { 6, 4, 12 + 2 * C }, { 7, 4, 16 + 2 * C }, { 8, 4, 20 + 2 * C },
-            { 9, 2 * C, 24 + 2 * C }, { 10, 2 * C, 24 + 4 * C },
-            { 11, 2 * C, 24 + 6 * C },
+            { 9, MIN(2 * C, 4), 24 + 2 * C }, { 10, MIN(2 * C, 4), 24 + 4 * C },
+            { 11, MIN(2 * C, 4), 24 + 6 * C },
             { 12, 4, 37 + 8 * C },
             { 13, 4, 25 + 8 * C }, { 14, 4, 29 + 8 * C },
             { 15, 4, 33 + 8 * C },

@@ -619,6 +619,29 @@ struct ATIR350State {
      * See ati_r350_cap.h for the record format.
      */
     char *cap_path;
+    /*
+     * regtrace=<file>: every register write, packet3 header and the
+     * vertex stage's first-vertex result, written as text once the
+     * CRTC goes to regtrace-width pixels wide (a game's fullscreen
+     * mode), up to regtrace-mb megabytes. Bring-up diagnostic.
+     */
+    char *rt_path;
+    uint32_t rt_width, rt_mb;
+    FILE *rt_fp;
+    bool rt_armed, rt_done, rt_tail;
+    unsigned rt_seg;
+    /*
+     * Occlusion queries (ZB_ZPASS_DATA / SU_REG_DEST / ZB_ZPASS_ADDR):
+     * between the reset and the dump, draws run in software and every
+     * sample passing the depth/stencil test is counted here.
+     */
+    bool zq_active;
+    uint32_t zpass_count;
+    uint32_t rt_rd_addr, rt_rd_val;  /* regtrace: the current run of reads */
+    uint64_t rt_rd_n, rt_rd_shown;
+    bool rt_mt;          /* regtrace-tail: a multitexture draw seen */
+    uint32_t rt_quiet;   /* draws since the last multitexture draw */
+    uint64_t rt_bytes;
     FILE *cap_fp;
     bool cap_arm;               /* record at all: a settable QOM property */
     int draw_xr;                /* swapper xor the LAST redraw used */
@@ -678,8 +701,17 @@ struct ATIR350State {
      * to a queue instead, which is why they are sized per request rather
      * than allocated inside the backend.
      */
-    uint8_t *gl_before, *gl_out, *gl_sw, *gl_texbuf;
-    size_t gl_rect_sz, gl_texbuf_sz;
+    uint8_t *gl_before, *gl_out, *gl_sw;
+    size_t gl_rect_sz;
+    /*
+     * Decode scratch for an uncacheable texture, one per unit (8 =
+     * R300_TEX_UNITS, checked in ati_r350_3d.c). A single shared buffer
+     * let a later unit's decode overwrite an earlier unit's texels in
+     * the same draw -- unit 0 then uploaded unit 1's bytes at its own
+     * size, which is GART textures (Quake 3) drawn as garbage.
+     */
+    uint8_t *gl_texbuf[8];
+    size_t gl_texbuf_sz[8];
     float *gl_verts;
     size_t gl_verts_sz;
     /*
@@ -759,7 +791,28 @@ struct ATIR350State {
     uint32_t *gl_zstage;                /* one rectangle of Z words */
     size_t gl_zstage_n;
     uint64_t gl_zflushes, gl_zflush_px, gl_zseed_px;
+    /*
+     * Decoded AGP/PCI-memory textures, keyed by their parameters and a
+     * hash of their bytes (r300_gl_texture): VRAM entries are guarded by
+     * dirty pages, these by content, since guest RAM has no such guard.
+     */
+#define R300_GL_BTEX 32
+    struct {
+        uint64_t key, hash, used;
+        uint8_t *rgba;
+        size_t sz;
+        bool live;
+    } gl_btex[R300_GL_BTEX];
+    uint64_t gl_btex_seq, gl_btex_hit, gl_btex_miss;
+    uint64_t r300_draw_gen;     /* bumped per draw: keys the DXT block cache */
+    uint64_t gl_rect_why[4];    /* destination rect refusals, by cause */
     uint64_t gl_rel[R350_GLR_MAX];      /* which hook ended a residency */
+    uint64_t gl_wait_ns[R350_GLR_MAX];  /* host time waiting on the GPU */
+    uint64_t sw_draw_ns, gpu_prep_ns;   /* software draws; GPU encoding */
+    uint64_t sw_draw_n, gpu_prep_n;
+    char *stats_log;                    /* stats-log=FILE, every 10 s */
+    QEMUTimer *stats_timer;
+    int64_t stats_t0;
     uint64_t gl_rel_px[R350_GLR_MAX];   /* ... and what it cost to */
     /* the same question one level finer for the 2D engine's three paths */
     uint64_t gl_rel_2d[R350_GL2D_MAX];
@@ -965,8 +1018,27 @@ struct ATIR350State {
      * the program changing.
      */
     char us_glsl[16 * 1024];
+    /* the same program as a general one, for draws sampling a cube map */
+    char us_glsl_gen[16 * 1024];
+    uint64_t us_glsl_gen_key;
+    bool us_glsl_gen_ok;
     bool us_glsl_ok;
+    /*
+     * Why the GL offload refused a draw's fragment program
+     * (R350_GLF_FSPROG), one count per reason that applies: 0 the
+     * interpreter cannot run it either, 1 more than one indirection
+     * level, 2 TEXKILL, 3 more than one fetch, 4 a fetch from a unit
+     * other than 0, 5 fetch coordinate not set 0's register; and the
+     * units those programs sample (bit per unit).
+     */
+    uint64_t us_refuse[6];
+    uint32_t us_refuse_units;
+    uint64_t us_grefuse[4];
     uint64_t us_glsl_key;
+    /* us-dump=FILE: each distinct translated program once, with state */
+    char *us_dump_path;
+    uint64_t us_dump_seen[64];
+    unsigned us_dump_n;
     uint64_t us_glsl_ok_n, us_glsl_refused_n;
     float us_konst_flat[R300_US_CONSTS * 4];
 
@@ -977,11 +1049,21 @@ struct ATIR350State {
      * is lost, like the 2D host-data accumulator above.
      */
     uint32_t r300_immd[16384];
+    /* the draw in setup fetches an interleaved (wider than 4) array */
+    bool r300_aos_wide;
+    uint64_t r300_clipped_draws;   /* draws cut at the eye plane */
 };
 
 
 /* ati_r350_dbg.c */
 const char *ati_r350_reg_name(uint32_t base);
+void ati_r350_rt_stop(ATIR350State *s, const char *why);
+void ati_r350_rt_printf(ATIR350State *s, const char *fmt, ...)
+    G_GNUC_PRINTF(2, 3);
+static inline bool ati_r350_rt_on(const ATIR350State *s)
+{
+    return s->rt_armed && !s->rt_done;
+}
 
 /*
  * Report a command the hardware understands and this model does not.

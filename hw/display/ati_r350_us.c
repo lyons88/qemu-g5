@@ -439,6 +439,7 @@ void r300_us_analyse(R300UsProgram *p,
     unsigned toff = (us_code_offset >> R300_US_CO_TEX_OFFSET_SHIFT) &
                     R300_US_CO_TEX_OFFSET_MASK;
     unsigned nfetch = 0, first_unit = 0, first_src = 0;
+    unsigned fsrc[4] = { 0 };
     unsigned i, lv;
 
     memset(p, 0, sizeof(*p));
@@ -558,6 +559,11 @@ void r300_us_analyse(R300UsProgram *p,
                         first_src = t->src;
                         p->tex_dst = t->dst;
                     }
+                    if (nfetch < 4) {
+                        p->gl_funit[nfetch] = t->unit;
+                        p->gl_fdst[nfetch] = t->dst;
+                        fsrc[nfetch] = t->src;
+                    }
                     nfetch++;
                 }
                 break;
@@ -599,6 +605,93 @@ void r300_us_analyse(R300UsProgram *p,
      * texture, so anything else has to run the interpreter -- which
      * performs its own fetches and gets it right.
      */
+    p->gl_simple_any = p->nlevels == 1 && nfetch <= 1 && !p->has_kill &&
+                       (!nfetch || (p->rs.tex_reg[0] >= 0 &&
+                                    first_src ==
+                                    (unsigned)p->rs.tex_reg[0]));
+    p->gl_unit = nfetch ? first_unit : 0;
+    {
+        unsigned k, f;
+        bool ok = p->nlevels == 1 && nfetch <= R300_GL_FETCHES &&
+                  !p->has_kill;
+
+        /*
+         * Every fetch sits in the one level and reads an interpolated
+         * coordinate set directly; none may read what an earlier one
+         * wrote (that would be a dependent read, which needs a second
+         * level).
+         */
+        p->gl_nfetch = nfetch;
+        for (f = 0; ok && f < nfetch; f++) {
+            int set = -1;
+
+            for (k = 0; k < R300_GL_FETCH_SETS; k++) {
+                if (p->rs.tex_reg[k] >= 0 &&
+                    fsrc[f] == (unsigned)p->rs.tex_reg[k]) {
+                    set = k;
+                    break;
+                }
+            }
+            for (k = 0; k < f; k++) {
+                if ((unsigned)p->gl_fdst[k] == fsrc[f]) {
+                    set = -1;
+                }
+            }
+            ok = set >= 0;
+            p->gl_fset[f] = set >= 0 ? set : 0;
+        }
+        p->gl_multi = ok;
+    }
+    {
+        unsigned k, j, ng = 0;
+        bool ok = p->valid && p->expressible;
+
+        p->gl_gwhy = 0;
+        memset(p->gl_gslot, 0, sizeof(p->gl_gslot));
+        memset(p->gl_gunit, 0, sizeof(p->gl_gunit));
+        /*
+         * Sets 4-7 reach the backend raw only (no footprint, no
+         * per-set size): fine for a set the program does arithmetic on,
+         * refused for one a fetch addresses directly.
+         */
+        for (k = R300_GL_FETCH_SETS; k < R300_TEXCOORDS; k++) {
+            if (p->rs.tex_reg[k] >= 0) {
+                for (j = 0; j < p->ntex && j < R300_US_TEX_SLOTS; j++) {
+                    if ((p->tex[j].op == R300_US_TEXOP_LD ||
+                         p->tex[j].op == R300_US_TEXOP_PROJ) &&
+                        p->tex[j].src == (unsigned)p->rs.tex_reg[k]) {
+                        ok = false;
+                        p->gl_gwhy = 2;
+                    }
+                }
+            }
+        }
+        for (k = 0; k < p->ntex && k < R300_US_TEX_SLOTS; k++) {
+            unsigned u = p->tex[k].unit;
+
+            if (p->tex[k].op != R300_US_TEXOP_LD &&
+                p->tex[k].op != R300_US_TEXOP_PROJ) {
+                continue;
+            }
+            if (u >= R300_TEX_UNITS) {
+                ok = false;
+                continue;
+            }
+            for (j = 0; j < ng && p->gl_gunit[j] != u; j++) {
+            }
+            if (j == ng) {
+                if (ng == 4) {
+                    ok = false;
+                    p->gl_gwhy = 1;
+                    continue;
+                }
+                p->gl_gunit[ng++] = u;
+            }
+            p->gl_gslot[u] = j;
+        }
+        p->gl_ngen = ng;
+        p->gl_general = ok;
+    }
     p->gl_simple = p->nlevels == 1 && nfetch <= 1 && !p->has_kill &&
                    (!nfetch || (first_unit == 0 &&
                                 p->rs.tex_reg[0] >= 0 &&

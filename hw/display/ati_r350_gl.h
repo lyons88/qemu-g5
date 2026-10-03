@@ -54,7 +54,7 @@
  * only unit 0, so that a backend growing multi-unit sampling does not
  * need the contract changed underneath it.
  */
-#define R350_GL_TEXCOORDS 1
+#define R350_GL_TEXCOORDS 4   /* four: Metal samples up to four units */
 #define R350_GL_TEXUNITS  8
 
 /*
@@ -87,7 +87,16 @@
  * the corners like the first so the fragment stage interpolates it with
  * the same weights.
  */
-#define R350_GL_VSTRIDE (45 + 8 * R350_GL_TEXCOORDS)
+/*
+ * ...and after those, each vertex's own coordinate sets RAW, four floats
+ * per set for all R350_GL_RAWSETS sets: (45+8C)..(44+8C+4R), what a
+ * fragment program reads from a set no fetch addresses directly (Metal
+ * reads the triangle's three from the buffer by primitive id; GL ignores
+ * them). Eight: the ATI demos' bump-mapped shaders route a tangent
+ * basis through sets 4-7 and only ever do arithmetic on it.
+ */
+#define R350_GL_RAWSETS 8
+#define R350_GL_VSTRIDE (45 + 8 * R350_GL_TEXCOORDS + 4 * R350_GL_RAWSETS)
 
 /*
  * How many uploaded textures the backend keeps, plus one: slot
@@ -99,8 +108,21 @@
  * miss class after the ones a writer killed. The device-side cache
  * bounds each entry at R300_GL_TEXCACHE_MAX texels, so this many slots
  * is a bounded worst case rather than an open-ended allocation.
+ *
+ * And at 32, JK2's timedemo evicted 199254 entries in one run -- a
+ * lightmapped Quake 3-engine frame touches more textures than that, so
+ * every frame decoded nearly all of them again.
  */
-#define R350_GL_TEXSLOTS 32
+#define R350_GL_TEXSLOTS 128
+
+/*
+ * Metal's reasons for handing a draw back, counted (darwin only):
+ * 0 request it cannot serve, 1 no pipeline, 2 texture upload failed,
+ * 3 slot bookkeeping mismatch, 4 vertex buffer full; 5 is not a
+ * decline -- a stale slot re-uploaded instead of refused.
+ */
+#define R350_MTL_DECLINE_N 6
+extern uint64_t r350_mtl_decline[R350_MTL_DECLINE_N];
 
 /* US_ALU_CONST vectors a translated fragment program may name */
 #define R350_GL_USK 32
@@ -173,7 +195,11 @@ typedef struct R350GlReq {
      * log2 w, floor log2 h }; `border` is the border colour as RGBA.
      */
     int levels[R350_GL_TEXUNITS];
-    int filt[R350_GL_TEXUNITS][11];
+    /* 1/size of the unit each coordinate set 0-3 is carried in */
+    float set_inv[4][2];
+    /* sets the program reads raw (s, t, r, q): r300_fs_setup()'s tc_raw */
+    unsigned tc_raw;
+    int filt[R350_GL_TEXUNITS][12];     /* [11]: a cube map, faces stacked */
     uint8_t border[R350_GL_TEXUNITS][4];
     uint32_t textured;
 
@@ -263,6 +289,12 @@ typedef struct R350GlReq {
      */
     uint32_t cb_off, cb_pitch;
     unsigned cb_xr;
+    /*
+     * 0: the colour buffer is ARGB8888. Otherwise it is 16bpp and this is
+     * its R300 COLORFORMAT (ARGB1555, RGB565 or ARGB4444), two bytes a
+     * pixel, packed and unpacked as r300_cb_pack16()/_unpack16() do.
+     */
+    unsigned cb_fmt;
     uint32_t z_off, z_pitch;
     int z_macro, z_micro, z_aa;
     unsigned z_xr;

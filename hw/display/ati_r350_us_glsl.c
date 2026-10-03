@@ -212,7 +212,8 @@ static void us_omod_clamp(UsBuf *b, const char *var, uint8_t omod, bool clamp)
     }
 }
 
-bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap)
+bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap, bool multi,
+                  bool force_gen)
 {
     UsBuf b = { .p = buf, .cap = cap };
     unsigned i, n;
@@ -227,11 +228,73 @@ bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap)
      * executor performs the fetches and renders them correctly. The
      * offload is what is given up, not the picture.
      */
-    if (!p->valid || !p->expressible || !p->gl_simple) {
+    bool gen;
+    unsigned lvl = 0, rawmask = 0, tcu[4] = { 0, 0, 0, 0 }, ntc = 0;
+
+    if (!p->valid || !p->expressible ||
+        !(multi ? (p->gl_multi || p->gl_general) : p->gl_simple_any)) {
         return false;
     }
-    us_emit(&b, "void us_main(vec4 tex0, vec4 col0, vec4 col1,\n"
-                "             out vec4 outc)\n{\n");
+    /*
+     * GENERAL: the program's own fetches, level by level, inside
+     * us_main() -- dependent reads and TEXKILL included -- exactly in the
+     * interpreter's order (r300_us_run). Coordinate sets reach the frame
+     * as r300_fs_frame() puts them there: normalised (s/q, t/q, 0, 1) for
+     * a set some fetch reads directly, raw (s, t, r, q) otherwise.
+     */
+    gen = multi && p->gl_general && (force_gen || !p->gl_multi);
+    if (gen) {
+        for (n = 0; n < 8; n++) {
+            if (p->rs.tex_reg[n] >= 0) {
+                bool fetched = false;
+
+                if (n < 4) {
+                    ntc = n + 1;
+                }
+                for (i = 0; i < p->ntex && i < R300_US_TEX_SLOTS; i++) {
+                    const R300UsTex *t = &p->tex[i];
+
+                    if ((t->op == R300_US_TEXOP_LD ||
+                         t->op == R300_US_TEXOP_PROJ) &&
+                        t->src == (unsigned)p->rs.tex_reg[n]) {
+                        if (!fetched) {
+                            tcu[n] = t->unit;
+                        }
+                        fetched = true;
+                    }
+                }
+                if (!fetched || n >= 4) {
+                    rawmask |= 1u << n;
+                }
+            }
+        }
+        if (!ntc) {
+            ntc = 1;
+        }
+    }
+    if (multi) {
+        /*
+         * The backend samples the fetches' units with these coordinate
+         * sets and hands the texels in as tex0 and tex1. The defines are
+         * part of the text, so they are part of the shader cache's key.
+         */
+        if (gen) {
+            us_emit(&b, "#define US_GENERAL 1\n#define US_RAWMASK %uu\n"
+                        "#define US_TC0 0\n#define US_TC1 0\n"
+                        "#define US_TC2 0\n#define US_TC3 0\n", rawmask);
+        } else {
+            us_emit(&b, "#define US_TC0 %u\n#define US_TC1 %u\n"
+                        "#define US_TC2 %u\n#define US_TC3 %u\n",
+                    p->gl_fset[0], p->gl_fset[1], p->gl_fset[2],
+                    p->gl_fset[3]);
+        }
+        us_emit(&b, "void us_main(vec4 tex0, vec4 col0, vec4 col1, "
+                    "vec4 tex1, vec4 tex2, vec4 tex3,\n"
+                    "             out vec4 outc)\n{\n");
+    } else {
+        us_emit(&b, "void us_main(vec4 tex0, vec4 col0, vec4 col1,\n"
+                    "             out vec4 outc)\n{\n");
+    }
     us_emit(&b, "    outc = vec4(0.0);\n");
     /*
      * Exactly the frame the interpreter clears, so an instruction naming
@@ -240,8 +303,26 @@ bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap)
     for (n = 0; n < p->nregs_used; n++) {
         us_emit(&b, "    precise vec4 R%u = vec4(0.0);\n", n);
     }
-    if (p->tex_dst >= 0 && (unsigned)p->tex_dst < p->nregs_used) {
+    if (gen) {
+        for (n = 0; n < 8; n++) {
+            if (p->rs.tex_reg[n] >= 0 &&
+                (unsigned)p->rs.tex_reg[n] < p->nregs_used) {
+                us_emit(&b, "    R%d = XI.tc[%u];\n", p->rs.tex_reg[n], n);
+            }
+        }
+    }
+    if (!gen && p->tex_dst >= 0 && (unsigned)p->tex_dst < p->nregs_used) {
         us_emit(&b, "    R%d = tex0;\n", p->tex_dst);
+    }
+    if (multi && !gen) {
+        unsigned f;
+
+        for (f = 1; f < p->gl_nfetch && f < 4; f++) {
+            if (p->gl_fdst[f] >= 0 &&
+                (unsigned)p->gl_fdst[f] < p->nregs_used) {
+                us_emit(&b, "    R%d = tex%u;\n", p->gl_fdst[f], f);
+            }
+        }
     }
     for (n = 0; n < R300_US_RS_COLS; n++) {
         if (p->rs.col_reg[n] >= 0 &&
@@ -251,10 +332,67 @@ bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap)
         }
     }
 
-    for (i = 0; i < p->nalu; i++) {
-        const R300UsAlu *a = &p->alu[i];
+    for (i = 0; i <= p->nalu; i++) {
+        const R300UsAlu *a = &p->alu[i < p->nalu ? i : 0];
         UsSrcName s[3];
         char A[128], B[128], C[128], aA[128], aB[128], aC[128];
+
+        /*
+         * Each level's texture instructions go in front of its first
+         * ALU slot (and after the last ALU for levels that have none
+         * left), the order r300_us_run() executes them in.
+         */
+        while (gen && lvl < p->nlevels &&
+               (i == p->nalu || p->level[lvl].alu_at <= i)) {
+            const R300UsLevel *L = &p->level[lvl];
+            unsigned k;
+
+            for (k = 0; k < L->ntex; k++) {
+                const R300UsTex *t = &p->tex[L->tex_at + k];
+
+                if (t->op == R300_US_TEXOP_TEXKILL) {
+                    us_emit(&b, "    if (R%u.x < 0.0 || R%u.y < 0.0 || "
+                                "R%u.z < 0.0 || R%u.w < 0.0) KILL = true;\n",
+                            t->src, t->src, t->src, t->src);
+                } else if (t->op == R300_US_TEXOP_LD ||
+                           t->op == R300_US_TEXOP_PROJ) {
+                    unsigned u = p->gl_gslot[t->unit & 7], ds = 0, m;
+                    bool found = false;
+
+                    /* the footprint: r300_us_der()'s choice of set */
+                    for (m = 0; m < ntc && !found; m++) {
+                        if (p->rs.tex_reg[m] == (int)t->src) {
+                            ds = m;
+                            found = true;
+                        }
+                    }
+                    for (m = 0; m < ntc && !found; m++) {
+                        if (tcu[m] == t->unit) {
+                            ds = m;
+                            found = true;
+                        }
+                    }
+                    if (u == 0) {
+                        us_emit(&b, "    R%u = ufetch(TX0, UF.tf, "
+                                    "int4(UF.iv[IV_TEXW], UF.iv[IV_TEXH], "
+                                    "UF.iv[IV_CLAMPS], UF.iv[IV_CLAMPT]), "
+                                    "UF.iv[IV_TEXTURED], N255, R%u, "
+                                    "XI.der[%u]);\n", t->dst, t->src, ds);
+                    } else {
+                        us_emit(&b, "    R%u = ufetch(TX%u, UF.tfx[%u], "
+                                    "int4(UF.tvx[%u][0], UF.tvx[%u][1], "
+                                    "UF.tvx[%u][2], UF.tvx[%u][3]), "
+                                    "UF.iv[IV_TEXTURED%u], N255, R%u, "
+                                    "XI.der[%u]);\n", t->dst, u, u - 1,
+                                u - 1, u - 1, u - 1, u - 1, u, t->src, ds);
+                    }
+                }
+            }
+            lvl++;
+        }
+        if (i == p->nalu) {
+            break;
+        }
 
         us_slot_names(s, a);
         us_arg_rgb(A, sizeof(A), s, a->rgb_sel[0], a->rgb_mod[0]);

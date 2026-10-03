@@ -111,7 +111,9 @@ enum {
     IV_SWMASK,
     /* zero-copy: where the buffers are in VRAM */
     IV_CBOFF, IV_CBPITCH, IV_CBX, IV_ZOFF, IV_ZPITCH, IV_ZMACRO, IV_ZMICRO,
-    IV_ZAA, IV_ZX, IV_VSZ,
+    IV_ZAA, IV_ZX, IV_VSZ, IV_CBFMT,
+    /* fetches 1-3 have a bound unit (tfx/tvx below) */
+    IV_TEXTURED1, IV_TEXTURED2, IV_TEXTURED3,
     IV_N = 40
 };
 
@@ -121,9 +123,15 @@ typedef struct MtlFsU {
     float pad[3];
     int32_t tf[16];
     int32_t iv[IV_N];
+    /* fetches 1-3's units: filter words, then w, h, clamp s, clamp t */
+    int32_t tfx[3][16];
+    int32_t tvx[3][4];
+    float sinv[4][2];           /* 1/size each coordinate set is carried in */
+    int32_t rawx;               /* sets read raw this draw (cube maps) */
 } MtlFsU;
 
-QEMU_BUILD_BUG_ON(sizeof(MtlFsU) != 32 + 64 + 4 * IV_N);
+QEMU_BUILD_BUG_ON(IV_TEXTURED3 >= IV_N);
+QEMU_BUILD_BUG_ON(sizeof(MtlFsU) != 32 + 64 + 4 * IV_N + 3 * 64 + 3 * 16 + 32 + 4);
 
 struct R350MtlCtx {
     id<MTLDevice> dev;
@@ -139,10 +147,15 @@ struct R350MtlCtx {
     uint64_t vsz;
 
     /* uploaded textures by caller slot, plus the scratch at the end */
-    id<MTLTexture> tex[R350_GL_TEXSLOTS + 1];
-    int tex_w[R350_GL_TEXSLOTS + 1], tex_h[R350_GL_TEXSLOTS + 1];
-    int tex_nl[R350_GL_TEXSLOTS + 1];
-    uint64_t tex_use[R350_GL_TEXSLOTS + 1];     /* serial last drawn in */
+    /*
+     * The caller's slots, its scratch (R350_GL_TEXSLOTS), and three more
+     * scratches of our own so that fetches 1-3 of one draw can each be
+     * untracked without overwriting fetch 0's upload: MTL_SLOTS.
+     */
+    id<MTLTexture> tex[R350_GL_TEXSLOTS + 4];
+    int tex_w[R350_GL_TEXSLOTS + 4], tex_h[R350_GL_TEXSLOTS + 4];
+    int tex_nl[R350_GL_TEXSLOTS + 4];
+    uint64_t tex_use[R350_GL_TEXSLOTS + 4];     /* serial last drawn in */
 
     MtlProg prog[MTL_PROGSLOTS];
     unsigned prog_next;
@@ -166,7 +179,7 @@ struct R350MtlCtx {
     /* what the open render pass already has set */
     id<MTLRenderPipelineState> enc_pso;
     id<MTLBuffer> enc_vb;
-    id<MTLTexture> enc_tex;
+    id<MTLTexture> enc_tex[4];
     int enc_vw, enc_vh;
 
     /* vertex and staging arenas: the one being filled, and spares */
@@ -183,6 +196,13 @@ struct R350MtlCtx {
     /* called from Metal's own thread as each committed buffer completes */
     void (*notify)(void *);
     void *notify_op;
+    /*
+     * Newest serial a completion handler has reported. A handler can
+     * run before the buffer's status reads Completed, so the reaper
+     * trusts this too -- else the woken engine sees nothing done and
+     * sleeps with no wake-up left.
+     */
+    uint64_t hw_done;
 };
 
 /*
@@ -221,6 +241,15 @@ static const char *mtl_body =
 "    float pad2;\n"
 "    int tf[16];\n"
 "    int iv[40];\n"
+"    int tfx[3][16];\n"
+"    int tvx[3][4];\n"
+"    float sinv[4][2];\n"
+"    int rawx;\n"
+"};\n"
+/* a general program's frame inputs: each set's value and footprint */
+"struct UsIn {\n"
+"    float4 tc[8];\n"
+"    float4 der[4];\n"
 "};\n"
 "#define IV_TEXW 0\n"
 "#define IV_TEXH 1\n"
@@ -258,6 +287,10 @@ static const char *mtl_body =
 "#define IV_ZAA 33\n"
 "#define IV_ZX 34\n"
 "#define IV_VSZ 35\n"
+"#define IV_CBFMT 36\n"
+"#define IV_TEXTURED1 37\n"
+"#define IV_TEXTURED2 38\n"
+"#define IV_TEXTURED3 39\n"
 "\n"
 "struct VOut {\n"
 "    float4 pos [[position]];\n"
@@ -270,6 +303,15 @@ static const char *mtl_body =
 "    float2 t0 [[flat]];\n"
 "    float2 t1 [[flat]];\n"
 "    float2 t2 [[flat]];\n"
+"    float2 u0 [[flat]];\n"
+"    float2 u1 [[flat]];\n"
+"    float2 u2 [[flat]];\n"
+"    float2 e0 [[flat]];\n"
+"    float2 e1 [[flat]];\n"
+"    float2 e2 [[flat]];\n"
+"    float2 f0 [[flat]];\n"
+"    float2 f1 [[flat]];\n"
+"    float2 f2 [[flat]];\n"
 "    float4 inv [[flat]];\n"
 "    float4 s0 [[flat]];\n"
 "    float4 s1 [[flat]];\n"
@@ -281,28 +323,6 @@ static const char *mtl_body =
 "{ return float2(v[o], v[o + 1]); }\n"
 "static float4 ld4(const device float *v, int o)\n"
 "{ return float4(v[o], v[o + 1], v[o + 2], v[o + 3]); }\n"
-"\n"
-"vertex VOut r350_vs(uint vid [[vertex_id]],\n"
-"                    const device float *vb [[buffer(0)]],\n"
-"                    constant float4 &rect [[buffer(1)]])\n"
-"{\n"
-"    const device float *v = vb + vid * R350_VSTRIDE;\n"
-"    VOut o;\n"
-"    float nx = (v[0] - rect.x) / rect.z * 2.0f - 1.0f;\n"
-"    float ny = (v[1] - rect.y) / rect.w * 2.0f - 1.0f;\n"
-/*
- * GL's NDC, negated in y: Metal's viewport puts NDC +1 at row 0, GL's
- * put -1 there, so this lands every vertex on the same window y.
- */
-"    o.pos = float4(nx, -ny, 0.0f, 1.0f);\n"
-"    o.p0 = ld2(v, OFF_P0); o.p1 = ld2(v, OFF_P1); o.p2 = ld2(v, OFF_P2);\n"
-"    o.c0 = ld4(v, OFF_C0); o.c1 = ld4(v, OFF_C1); o.c2 = ld4(v, OFF_C2);\n"
-"    o.t0 = ld2(v, OFF_T0); o.t1 = ld2(v, OFF_T1); o.t2 = ld2(v, OFF_T2);\n"
-"    o.inv = ld4(v, OFF_INV);\n"
-"    o.s0 = ld4(v, OFF_S0); o.s1 = ld4(v, OFF_S1); o.s2 = ld4(v, OFF_S2);\n"
-"    o.zb = ld4(v, OFF_Z);\n"
-"    return o;\n"
-"}\n"
 "\n"
 "static float bf(int code, float sc, float sa, float dc, float da,\n"
 "               float kc, float ka)\n"
@@ -360,14 +380,19 @@ static const char *mtl_body =
 "    return i < 0 || i >= n ? -1 : i;\n"
 "}\n"
 "\n"
-"static uint4 tfetch(texture2d<uint, access::read> t, constant FsU &u,\n"
-"                    int l, int i, int j)\n"
+"static uint4 tfetch(texture2d<uint, access::read> t, constant int *tf, int4 tv,\n"
+"                    int l, int i, int j, int face)\n"
 "{\n"
 "    if (i < 0 || j < 0)\n"
-"        return uint4(uint(u.tf[11]), uint(u.tf[12]), uint(u.tf[13]),\n"
-"                     uint(u.tf[14]));\n"
+"        return uint4(uint(tf[11]), uint(tf[12]), uint(tf[13]),\n"
+"                     uint(tf[14]));\n"
 /* the guard GL's texelFetch did not need: never read outside the chain */
 "    uint ll = min(uint(max(l, 0)), t.get_num_mip_levels() - 1u);\n"
+"    if (face >= 0) {\n"
+"        uint fh = max(t.get_height(ll) / 6u, 1u);\n"
+"        uint2 q = min(uint2(i, j), uint2(t.get_width(ll) - 1u, fh - 1u));\n"
+"        return t.read(uint2(q.x, q.y + uint(face) * fh), ll);\n"
+"    }\n"
 "    uint2 p = min(uint2(i, j), uint2(t.get_width(ll) - 1u,\n"
 "                                      t.get_height(ll) - 1u));\n"
 "    return t.read(p, ll);\n"
@@ -378,16 +403,16 @@ static const char *mtl_body =
 "    return uint4((int4(a) * (256 - f) + int4(b) * f + 128) >> 8);\n"
 "}\n"
 "\n"
-"static uint4 tlevel(texture2d<uint, access::read> t, constant FsU &u,\n"
-"                    int l, float fs, float ft, bool lin)\n"
+"static uint4 tlevel(texture2d<uint, access::read> t, constant int *tf, int4 tv,\n"
+"                    int l, float fs, float ft, bool lin, int face)\n"
 "{\n"
-"    int w = max(u.iv[IV_TEXW] >> l, 1), h = max(u.iv[IV_TEXH] >> l, 1);\n"
-"    float ss = tc_pre(ldexp(fs, -min(l, u.tf[9])), w, u.iv[IV_CLAMPS]);\n"
-"    float tt = tc_pre(ldexp(ft, -min(l, u.tf[10])), h, u.iv[IV_CLAMPT]);\n"
+"    int w = max(tv.x >> l, 1), h = max(tv.y >> l, 1);\n"
+"    float ss = tc_pre(ldexp(fs, -min(l, tf[9])), w, tv.z);\n"
+"    float tt = tc_pre(ldexp(ft, -min(l, tf[10])), h, tv.w);\n"
 "    if (!lin)\n"
-"        return tfetch(t, u, l,\n"
-"                      tc_idx(int(floor(ss)), w, u.iv[IV_CLAMPS], true),\n"
-"                      tc_idx(int(floor(tt)), h, u.iv[IV_CLAMPT], true));\n"
+"        return tfetch(t, tf, tv, l,\n"
+"                      tc_idx(int(floor(ss)), w, tv.z, true),\n"
+"                      tc_idx(int(floor(tt)), h, tv.w, true), face);\n"
 "    float fx = ss - 0.5f;\n"
 "    float fy = tt - 0.5f;\n"
 "    float x0 = floor(fx);\n"
@@ -399,32 +424,32 @@ static const char *mtl_body =
 "    int i0 = int(x0), j0 = int(y0);\n"
 "    if (wx == 256) { i0++; wx = 0; }\n"
 "    if (wy == 256) { j0++; wy = 0; }\n"
-"    int i1 = tc_idx(i0 + 1, w, u.iv[IV_CLAMPS], false);\n"
-"    int j1 = tc_idx(j0 + 1, h, u.iv[IV_CLAMPT], false);\n"
-"    i0 = tc_idx(i0, w, u.iv[IV_CLAMPS], false);\n"
-"    j0 = tc_idx(j0, h, u.iv[IV_CLAMPT], false);\n"
-"    uint4 t00 = tfetch(t, u, l, i0, j0);\n"
-"    uint4 t10 = wx != 0 ? tfetch(t, u, l, i1, j0) : t00;\n"
+"    int i1 = tc_idx(i0 + 1, w, tv.z, false);\n"
+"    int j1 = tc_idx(j0 + 1, h, tv.w, false);\n"
+"    i0 = tc_idx(i0, w, tv.z, false);\n"
+"    j0 = tc_idx(j0, h, tv.w, false);\n"
+"    uint4 t00 = tfetch(t, tf, tv, l, i0, j0, face);\n"
+"    uint4 t10 = wx != 0 ? tfetch(t, tf, tv, l, i1, j0, face) : t00;\n"
 "    if (wy == 0) return wx != 0 ? tlerp(t00, t10, wx) : t00;\n"
-"    uint4 t01 = tfetch(t, u, l, i0, j1);\n"
-"    uint4 t11 = wx != 0 ? tfetch(t, u, l, i1, j1) : t01;\n"
+"    uint4 t01 = tfetch(t, tf, tv, l, i0, j1, face);\n"
+"    uint4 t11 = wx != 0 ? tfetch(t, tf, tv, l, i1, j1, face) : t01;\n"
 "    int4 top = int4(t00) * (256 - wx) + int4(t10) * wx;\n"
 "    int4 bot = int4(t01) * (256 - wx) + int4(t11) * wx;\n"
 "    return uint4((top * (256 - wy) + bot * wy + 32768) >> 16);\n"
 "}\n"
 "\n"
-"static uint4 tmip(texture2d<uint, access::read> t, constant FsU &u,\n"
-"                  int lod, float fs, float ft)\n"
+"static uint4 tmip(texture2d<uint, access::read> t, constant int *tf, int4 tv,\n"
+"                  int lod, float fs, float ft, int face)\n"
 "{\n"
-"    bool lin = u.tf[3] != 1;\n"
-"    int lo = min(max(lod, u.tf[6] * 256), u.tf[7] * 256);\n"
-"    if (u.tf[4] == 1)\n"
-"        return tlevel(t, u, min((lo + 128) >> 8, u.tf[7]), fs, ft, lin);\n"
+"    bool lin = tf[3] != 1;\n"
+"    int lo = min(max(lod, tf[6] * 256), tf[7] * 256);\n"
+"    if (tf[4] == 1)\n"
+"        return tlevel(t, tf, tv, min((lo + 128) >> 8, tf[7]), fs, ft, lin, face);\n"
 "    int l = lo >> 8;\n"
-"    if (u.tf[4] != 2 || l >= u.tf[7] || (lo & 255) == 0)\n"
-"        return tlevel(t, u, l, fs, ft, lin);\n"
-"    return tlerp(tlevel(t, u, l, fs, ft, lin),\n"
-"                 tlevel(t, u, l + 1, fs, ft, lin), lo & 255);\n"
+"    if (tf[4] != 2 || l >= tf[7] || (lo & 255) == 0)\n"
+"        return tlevel(t, tf, tv, l, fs, ft, lin, face);\n"
+"    return tlerp(tlevel(t, tf, tv, l, fs, ft, lin, face),\n"
+"                 tlevel(t, tf, tv, l + 1, fs, ft, lin, face), lo & 255);\n"
 "}\n"
 "\n"
 "static int tlog2(float v)\n"
@@ -435,32 +460,32 @@ static const char *mtl_body =
 "    return (int(b >> 23) - 127) * 256 + int((b >> 15) & 0xffu);\n"
 "}\n"
 "\n"
-"static uint4 tfilter(texture2d<uint, access::read> t, constant FsU &u,\n"
-"                     float fs, float ft, float4 der)\n"
+"static uint4 tfilter(texture2d<uint, access::read> t, constant int *tf, int4 tv,\n"
+"                     float fs, float ft, float4 der, int face)\n"
 "{\n"
 "    int lod = 0, nl = 0;\n"
 "    float ax = 0.0f, ay = 0.0f;\n"
-"    if (u.tf[1] != 0) {\n"
+"    if (tf[1] != 0) {\n"
 "        float m = der.x * der.x;\n"
 "        float n = der.y * der.y;\n"
 "        float px = m + n;\n"
 "        m = der.z * der.z;\n"
 "        n = der.w * der.w;\n"
 "        float py = m + n;\n"
-"        if (u.tf[3] == 3) {\n"
+"        if (tf[3] == 3) {\n"
 "            int lmaj = tlog2(px >= py ? px : py);\n"
 "            int lmin = tlog2(px >= py ? py : px);\n"
-"            nl = min(max(((lmaj - lmin) / 2 + 255) >> 8, 0), u.tf[5]);\n"
+"            nl = min(max(((lmaj - lmin) / 2 + 255) >> 8, 0), tf[5]);\n"
 "            lod = (lmaj >> 1) - nl * 256;\n"
 "            ax = px >= py ? der.x : der.z;\n"
 "            ay = px >= py ? der.y : der.w;\n"
 "        } else {\n"
 "            lod = tlog2(px >= py ? px : py) >> 1;\n"
 "        }\n"
-"        lod += u.tf[8];\n"
+"        lod += tf[8];\n"
 "    }\n"
-"    if (lod <= 0) return tlevel(t, u, u.tf[6], fs, ft, u.tf[2] != 1);\n"
-"    if (nl == 0) return tmip(t, u, lod, fs, ft);\n"
+"    if (lod <= 0) return tlevel(t, tf, tv, tf[6], fs, ft, tf[2] != 1, face);\n"
+"    if (nl == 0) return tmip(t, tf, tv, lod, fs, ft, face);\n"
 "    int N = 1 << nl;\n"
 "    uint4 sum = uint4(0u);\n"
 "    for (int k = 0; k < N; k++) {\n"
@@ -469,7 +494,7 @@ static const char *mtl_body =
 "        float dt = ay * ok;\n"
 "        float s1 = fs + ds;\n"
 "        float t1 = ft + dt;\n"
-"        sum += tmip(t, u, lod, s1, t1);\n"
+"        sum += tmip(t, tf, tv, lod, s1, t1, face);\n"
 "    }\n"
 "    return (sum + uint(N >> 1)) >> uint(nl);\n"
 "}\n"
@@ -495,6 +520,124 @@ static const char *mtl_body =
 "    float ry = r * iq;\n"
 "    dx = rx;\n"
 "    dy = ry;\n"
+"}\n"
+"\n"
+/*
+ * One unit's texel for this fragment: the filtered path with its
+ * analytic derivatives (r300_tc_der) or the point fetch, exactly as the
+ * fragment stage did it inline for unit 0 before a second unit existed.
+ * a0..a2 are the triangle's corners' coordinates in this unit's set,
+ * w0..w2 the perspective-corrected weights.
+ */
+"static float4 tsample(texture2d<uint, access::read> tex, constant int *tf,\n"
+"                      int4 tv, constant float *N255, VOut in,\n"
+"                      float2 a0, float2 a1, float2 a2, float w0, float w1,\n"
+"                      float w2, float iq, bool persp)\n"
+"{\n"
+"    float2 st = fma(float2(w2), a2, fma(float2(w1), a1, w0 * a0));\n"
+"    float ts = st.x, tt = st.y;\n"
+"    if (tf[0] != 0) {\n"
+"        float4 der = float4(0.0f);\n"
+"        if (tf[1] != 0) {\n"
+"            float ga0 = -(in.p2.y - in.p1.y) * in.inv.x;\n"
+"            float gb0 = (in.p2.x - in.p1.x) * in.inv.x;\n"
+"            float ga1 = -(in.p0.y - in.p2.y) * in.inv.x;\n"
+"            float gb1 = (in.p0.x - in.p2.x) * in.inv.x;\n"
+"            float3 ga = float3(ga0, ga1, -(ga0 + ga1));\n"
+"            float3 gb = float3(gb0, gb1, -(gb0 + gb1));\n"
+"            if (persp) {\n"
+"                ga = ga * in.inv.yzw;\n"
+"                gb = gb * in.inv.yzw;\n"
+"            }\n"
+"            float dx, dy;\n"
+"            tc_der(ga, gb, a0.x, a1.x, a2.x, ts, iq, dx, dy);\n"
+"            der.x = dx; der.z = dy;\n"
+"            tc_der(ga, gb, a0.y, a1.y, a2.y, tt, iq, dx, dy);\n"
+"            der.y = dx; der.w = dy;\n"
+"        }\n"
+"        uint4 tu = tfilter(tex, tf, tv, ts, tt, der, -1);\n"
+"        return float4(N255[tu.r], N255[tu.g], N255[tu.b], N255[tu.a]);\n"
+"    }\n"
+"    int tw = tv.x, th = tv.y;\n"
+"    int tx = int(ts);\n"
+"    int ty = int(tt);\n"
+"    if (tv.z <= 1 && tw > 0) {\n"
+"        tx = tx % tw;\n"
+"        if (tx < 0) tx += tw;\n"
+"    } else {\n"
+"        tx = clamp(tx, 0, tw - 1);\n"
+"    }\n"
+"    if (tv.w <= 1 && th > 0) {\n"
+"        ty = ty % th;\n"
+"        if (ty < 0) ty += th;\n"
+"    } else {\n"
+"        ty = clamp(ty, 0, th - 1);\n"
+"    }\n"
+"    uint4 tu = tfetch(tex, tf, tv, 0, tx, ty, -1);\n"
+"    return float4(N255[tu.r], N255[tu.g], N255[tu.b], N255[tu.a]);\n"
+"}\n"
+"\n"
+/*
+ * A fetch from INSIDE a general program (r300_us_sample): the coordinate
+ * is a frame register, normalised; the footprint is that of the set
+ * r300_us_der() would pick, normalised too. Both scale by the size of
+ * the unit being fetched.
+ */
+"static float4 ufetch(texture2d<uint, access::read> T, constant int *tf,\n"
+"                     int4 tv, int on, constant float *N255, float4 c,\n"
+"                     float4 dn)\n"
+"{\n"
+"    if (on == 0) return float4(1.0f);\n"
+/* r300_us_sample()'s cube map: GL's face selection, faces stacked */
+"    if (tf[15] != 0) {\n"
+"        float x = c.x, y = c.y, z = c.z;\n"
+"        float ax = abs(x), ay = abs(y), az = abs(z), ma, sc, tc;\n"
+"        int face;\n"
+"        if (ax >= ay && ax >= az) {\n"
+"            face = x >= 0.0f ? 0 : 1; ma = ax;\n"
+"            sc = x >= 0.0f ? -z : z; tc = -y;\n"
+"        } else if (ay >= az) {\n"
+"            face = y >= 0.0f ? 2 : 3; ma = ay;\n"
+"            sc = x; tc = y >= 0.0f ? z : -z;\n"
+"        } else {\n"
+"            face = z >= 0.0f ? 4 : 5; ma = az;\n"
+"            sc = z >= 0.0f ? x : -x; tc = -y;\n"
+"        }\n"
+"        if (!(ma > 0.0f)) ma = 1.0f;\n"
+"        int fh = max(tv.y / 6, 1);\n"
+"        int4 cv = int4(tv.x, fh, tv.z, tv.w);\n"
+"        float k = 0.5f / ma;\n"
+"        float4 der = dn * float4(k * float(tv.x), k * float(fh),\n"
+"                                 k * float(tv.x), k * float(fh));\n"
+"        float cs = (sc / ma + 1.0f) * 0.5f * float(tv.x);\n"
+"        float ct = (tc / ma + 1.0f) * 0.5f * float(fh);\n"
+"        uint4 tu = tfilter(T, tf, cv, cs, ct, der, face);\n"
+"        return float4(N255[tu.r], N255[tu.g], N255[tu.b], N255[tu.a]);\n"
+"    }\n"
+"    float ts = c.x * float(tv.x), tt = c.y * float(tv.y);\n"
+"    if (tf[0] != 0) {\n"
+"        float4 der = dn * float4(float(tv.x), float(tv.y), float(tv.x),\n"
+"                                 float(tv.y));\n"
+"        uint4 tu = tfilter(T, tf, tv, ts, tt, der, -1);\n"
+"        return float4(N255[tu.r], N255[tu.g], N255[tu.b], N255[tu.a]);\n"
+"    }\n"
+"    int tw = tv.x, th = tv.y;\n"
+"    int tx = int(ts);\n"
+"    int ty = int(tt);\n"
+"    if (tv.z <= 1 && tw > 0) {\n"
+"        tx = tx % tw;\n"
+"        if (tx < 0) tx += tw;\n"
+"    } else {\n"
+"        tx = clamp(tx, 0, tw - 1);\n"
+"    }\n"
+"    if (tv.w <= 1 && th > 0) {\n"
+"        ty = ty % th;\n"
+"        if (ty < 0) ty += th;\n"
+"    } else {\n"
+"        ty = clamp(ty, 0, th - 1);\n"
+"    }\n"
+"    uint4 tu = tfetch(T, tf, tv, 0, tx, ty, -1);\n"
+"    return float4(N255[tu.r], N255[tu.g], N255[tu.b], N255[tu.a]);\n"
 "}\n"
 "\n"
 /* r300_zs_cmp(): `a` is the incoming value, `b` the stored one */
@@ -571,6 +714,53 @@ static const char *mtl_body =
 "    return off + a;\n"
 "}\n"
 "\n"
+;
+
+/*
+ * The second half of the shader: the vertex function and the fragment
+ * function, which calls the guest's us_main() -- so it follows it.
+ * (The first half, above, is what us_main() itself may call.)
+ */
+static const char *mtl_body2 =
+"#ifndef US_TC0\n"
+"#define US_TC0 0\n"
+"#define US_TC1 0\n"
+"#define US_TC2 0\n"
+"#define US_TC3 0\n"
+"#endif\n"
+"vertex VOut r350_vs(uint vid [[vertex_id]],\n"
+"                    const device float *vb [[buffer(0)]],\n"
+"                    constant float4 &rect [[buffer(1)]])\n"
+"{\n"
+"    const device float *v = vb + vid * R350_VSTRIDE;\n"
+"    VOut o;\n"
+"    float nx = (v[0] - rect.x) / rect.z * 2.0f - 1.0f;\n"
+"    float ny = (v[1] - rect.y) / rect.w * 2.0f - 1.0f;\n"
+/*
+ * GL's NDC, negated in y: Metal's viewport puts NDC +1 at row 0, GL's
+ * put -1 there, so this lands every vertex on the same window y.
+ */
+"    o.pos = float4(nx, -ny, 0.0f, 1.0f);\n"
+"    o.p0 = ld2(v, OFF_P0); o.p1 = ld2(v, OFF_P1); o.p2 = ld2(v, OFF_P2);\n"
+"    o.c0 = ld4(v, OFF_C0); o.c1 = ld4(v, OFF_C1); o.c2 = ld4(v, OFF_C2);\n"
+"    o.t0 = ld2(v, OFF_T0 + 2 * US_TC0);\n"
+"    o.t1 = ld2(v, OFF_T1 + 2 * US_TC0);\n"
+"    o.t2 = ld2(v, OFF_T2 + 2 * US_TC0);\n"
+"    o.u0 = ld2(v, OFF_T0 + 2 * US_TC1);\n"
+"    o.u1 = ld2(v, OFF_T1 + 2 * US_TC1);\n"
+"    o.u2 = ld2(v, OFF_T2 + 2 * US_TC1);\n"
+"    o.e0 = ld2(v, OFF_T0 + 2 * US_TC2);\n"
+"    o.e1 = ld2(v, OFF_T1 + 2 * US_TC2);\n"
+"    o.e2 = ld2(v, OFF_T2 + 2 * US_TC2);\n"
+"    o.f0 = ld2(v, OFF_T0 + 2 * US_TC3);\n"
+"    o.f1 = ld2(v, OFF_T1 + 2 * US_TC3);\n"
+"    o.f2 = ld2(v, OFF_T2 + 2 * US_TC3);\n"
+"    o.inv = ld4(v, OFF_INV);\n"
+"    o.s0 = ld4(v, OFF_S0); o.s1 = ld4(v, OFF_S1); o.s2 = ld4(v, OFF_S2);\n"
+"    o.zb = ld4(v, OFF_Z);\n"
+"    return o;\n"
+"}\n"
+"\n"
 /*
  * The fragment stage writes emulated VRAM itself. raster_order_group(0)
  * is what makes that exact: fragments landing on one pixel run their
@@ -583,16 +773,21 @@ static const char *mtl_body =
 "                      constant float *N255 [[buffer(2)]],\n"
 "                      device uint *vram [[buffer(3), raster_order_group(0)]],\n"
 "                      device uchar *vram8 [[buffer(4), raster_order_group(0)]],\n"
-"                      texture2d<uint, access::read> tex [[texture(0)]])\n"
+"                      texture2d<uint, access::read> tex [[texture(0)]],\n"
+"                      texture2d<uint, access::read> tex1 [[texture(1)]],\n"
+"                      texture2d<uint, access::read> tex2 [[texture(2)]],\n"
+"                      texture2d<uint, access::read> tex3 [[texture(3)]],\n"
+"                      const device float *vbf [[buffer(5)]],\n"
+"                      uint pid [[primitive_id]])\n"
 "{\n"
 "    uint pxi = uint(in.pos.x), pyi = uint(in.pos.y);\n"
 "    uint vsz = uint(u.iv[IV_VSZ]);\n"
 "    uint wm = uint(u.iv[IV_WMASK]);\n"
+"    uint cbf = uint(u.iv[IV_CBFMT]);\n"
 "    uint caddr = uint(u.iv[IV_CBOFF]) + pyi * uint(u.iv[IV_CBPITCH]) +\n"
-"                 pxi * 4u;\n"
+"                 pxi * (cbf != 0u ? 2u : 4u);\n"
 "    uint cbx = uint(u.iv[IV_CBX]);\n"
 "    float4 c;\n"
-"    float ts, tt;\n"
 /* r300_raster_tri()'s own weights, expression for expression */
 "    float inv = in.inv.x;\n"
 "    float px = in.pos.x;\n"
@@ -616,53 +811,92 @@ static const char *mtl_body =
 "        w0 = pq0 * iq; w1 = pq1 * iq; w2 = pq2 * iq;\n"
 "    }\n"
 "    c = fma(float4(w2), in.c2, fma(float4(w1), in.c1, w0 * in.c0));\n"
-"    float2 st = fma(float2(w2), in.t2, fma(float2(w1), in.t1, w0 * in.t0));\n"
-"    ts = st.x; tt = st.y;\n"
 "    float4 c1 = fma(float4(w2), in.s2, fma(float4(w1), in.s1, w0 * in.s0));\n"
 "    float4 texel = float4(1.0f);\n"
-"    if (u.iv[IV_TEXTURED] != 0 && u.tf[0] != 0) {\n"
-"        float4 der = float4(0.0f);\n"
-"        if (u.tf[1] != 0) {\n"
-"            float a0 = -(in.p2.y - in.p1.y) * in.inv.x;\n"
-"            float b0 = (in.p2.x - in.p1.x) * in.inv.x;\n"
-"            float a1 = -(in.p0.y - in.p2.y) * in.inv.x;\n"
-"            float b1 = (in.p0.x - in.p2.x) * in.inv.x;\n"
-"            float3 ga = float3(a0, a1, -(a0 + a1));\n"
-"            float3 gb = float3(b0, b1, -(b0 + b1));\n"
-"            if (persp) {\n"
-"                ga = ga * in.inv.yzw;\n"
-"                gb = gb * in.inv.yzw;\n"
+"    if (u.iv[IV_TEXTURED] != 0)\n"
+"        texel = tsample(tex, u.tf, int4(u.iv[IV_TEXW], u.iv[IV_TEXH],\n"
+"                        u.iv[IV_CLAMPS], u.iv[IV_CLAMPT]), N255, in,\n"
+"                        in.t0, in.t1, in.t2, w0, w1, w2, iq, persp);\n"
+"    float4 texel1 = float4(1.0f);\n"
+"    if (u.iv[IV_TEXTURED1] != 0)\n"
+"        texel1 = tsample(tex1, u.tfx[0], int4(u.tvx[0][0], u.tvx[0][1],\n"
+"                         u.tvx[0][2], u.tvx[0][3]), N255, in,\n"
+"                         in.u0, in.u1, in.u2, w0, w1, w2, iq, persp);\n"
+"    float4 texel2 = float4(1.0f);\n"
+"    if (u.iv[IV_TEXTURED2] != 0)\n"
+"        texel2 = tsample(tex2, u.tfx[1], int4(u.tvx[1][0], u.tvx[1][1],\n"
+"                         u.tvx[1][2], u.tvx[1][3]), N255, in,\n"
+"                         in.e0, in.e1, in.e2, w0, w1, w2, iq, persp);\n"
+"    float4 texel3 = float4(1.0f);\n"
+"    if (u.iv[IV_TEXTURED3] != 0)\n"
+"        texel3 = tsample(tex3, u.tfx[2], int4(u.tvx[2][0], u.tvx[2][1],\n"
+"                         u.tvx[2][2], u.tvx[2][3]), N255, in,\n"
+"                         in.f0, in.f1, in.f2, w0, w1, w2, iq, persp);\n"
+"    UsIn XI;\n"
+"    for (int k = 0; k < 8; k++) {\n"
+"        XI.tc[k] = float4(0.0f, 0.0f, 0.0f, 1.0f);\n"
+"        if (k < 4) XI.der[k] = float4(0.0f);\n"
+"    }\n"
+/*
+ * A general program's coordinate sets, from the triangle's three
+ * vertices in the buffer: the interpolation and footprint the software
+ * rasterizer's per-pixel loop computes for them (r300_raster_tri).
+ */
+"#ifdef US_GENERAL\n"
+"    {\n"
+"        const device float *V0 = vbf + (pid * 3u) * uint(R350_VSTRIDE);\n"
+"        const device float *V1 = V0 + R350_VSTRIDE;\n"
+"        const device float *V2 = V1 + R350_VSTRIDE;\n"
+"        float ga0 = -(in.p2.y - in.p1.y) * in.inv.x;\n"
+"        float gb0 = (in.p2.x - in.p1.x) * in.inv.x;\n"
+"        float ga1 = -(in.p0.y - in.p2.y) * in.inv.x;\n"
+"        float gb1 = (in.p0.x - in.p2.x) * in.inv.x;\n"
+"        float3 ga = float3(ga0, ga1, -(ga0 + ga1));\n"
+"        float3 gb = float3(gb0, gb1, -(gb0 + gb1));\n"
+"        if (persp) {\n"
+"            ga = ga * in.inv.yzw;\n"
+"            gb = gb * in.inv.yzw;\n"
+"        }\n"
+"        for (int k = 0; k < 4; k++) {\n"
+"            float2 a0 = ld2(V0, 6 + 2 * k);\n"
+"            float2 a1 = ld2(V1, 6 + 2 * k);\n"
+"            float2 a2 = ld2(V2, 6 + 2 * k);\n"
+"            float2 st = fma(float2(w2), a2, fma(float2(w1), a1, w0 * a0));\n"
+"            float2 si = float2(u.sinv[k][0], u.sinv[k][1]);\n"
+"            if ((((US_RAWMASK | uint(u.rawx)) >> uint(k)) & 1u) != 0u) {\n"
+"                float4 r0 = ld4(V0, OFF_RAW + 4 * k);\n"
+"                float4 r1 = ld4(V1, OFF_RAW + 4 * k);\n"
+"                float4 r2 = ld4(V2, OFF_RAW + 4 * k);\n"
+"                XI.tc[k] = fma(float4(w2), r2,\n"
+"                               fma(float4(w1), r1, w0 * r0));\n"
+"            } else {\n"
+"                XI.tc[k] = float4(st.x * si.x, st.y * si.y, 0.0f, 1.0f);\n"
 "            }\n"
 "            float dx, dy;\n"
-"            tc_der(ga, gb, in.t0.x, in.t1.x, in.t2.x, ts, iq, dx, dy);\n"
-"            der.x = dx; der.z = dy;\n"
-"            tc_der(ga, gb, in.t0.y, in.t1.y, in.t2.y, tt, iq, dx, dy);\n"
-"            der.y = dx; der.w = dy;\n"
+"            tc_der(ga, gb, a0.x, a1.x, a2.x, st.x, iq, dx, dy);\n"
+"            XI.der[k].x = dx * si.x;\n"
+"            XI.der[k].z = dy * si.x;\n"
+"            tc_der(ga, gb, a0.y, a1.y, a2.y, st.y, iq, dx, dy);\n"
+"            XI.der[k].y = dx * si.y;\n"
+"            XI.der[k].w = dy * si.y;\n"
 "        }\n"
-"        uint4 tu = tfilter(tex, u, ts, tt, der);\n"
-"        texel = float4(N255[tu.r], N255[tu.g], N255[tu.b], N255[tu.a]);\n"
-"    } else if (u.iv[IV_TEXTURED] != 0) {\n"
-"        int tw = u.iv[IV_TEXW], th = u.iv[IV_TEXH];\n"
-"        int tx = int(ts);\n"
-"        int ty = int(tt);\n"
-"        if (u.iv[IV_CLAMPS] <= 1 && tw > 0) {\n"
-"            tx = tx % tw;\n"
-"            if (tx < 0) tx += tw;\n"
-"        } else {\n"
-"            tx = clamp(tx, 0, tw - 1);\n"
+"        for (int k = 4; k < 8; k++) {\n"
+"            if ((((US_RAWMASK | uint(u.rawx)) >> uint(k)) & 1u) != 0u) {\n"
+"                float4 r0 = ld4(V0, OFF_RAW + 4 * k);\n"
+"                float4 r1 = ld4(V1, OFF_RAW + 4 * k);\n"
+"                float4 r2 = ld4(V2, OFF_RAW + 4 * k);\n"
+"                XI.tc[k] = fma(float4(w2), r2,\n"
+"                               fma(float4(w1), r1, w0 * r0));\n"
+"            }\n"
 "        }\n"
-"        if (u.iv[IV_CLAMPT] <= 1 && th > 0) {\n"
-"            ty = ty % th;\n"
-"            if (ty < 0) ty += th;\n"
-"        } else {\n"
-"            ty = clamp(ty, 0, th - 1);\n"
-"        }\n"
-"        uint4 tu = tfetch(tex, u, 0, tx, ty);\n"
-"        texel = float4(N255[tu.r], N255[tu.g], N255[tu.b], N255[tu.a]);\n"
 "    }\n"
+"#endif\n"
 "    {\n"
 "        float4 shaded;\n"
-"        us_main(texel, c, c1, shaded, USK);\n"
+"        bool KILL = false;\n"
+"        us_main(texel, c, c1, texel1, texel2, texel3, shaded, USK,\n"
+"                tex, tex1, tex2, tex3, u, N255, XI, KILL);\n"
+"        if (KILL) discard_fragment();\n"
 "        c = shaded;\n"
 "    }\n"
 "    if (u.iv[IV_ATEST] != 0) {\n"
@@ -759,8 +993,29 @@ static const char *mtl_body =
  * The blend, against the pixel as the previous primitive left it --
  * read from VRAM in raster order. Cat_7's expressions verbatim.
  */
-"    if (!live || wm == 0u || caddr + 4u > vsz) return;\n"
-"    uint dv = lanes(vram[caddr >> 2], cbx);\n"
+"    if (!live || wm == 0u || caddr + (cbf != 0u ? 2u : 4u) > vsz) return;\n"
+"    uint dv;\n"
+"    if (cbf != 0u) {\n"
+/* r300_cb_unpack16(), byte by byte through the swapper like r300_read_dst() */
+"        uint v = uint(vram8[caddr ^ cbx]) | (uint(vram8[(caddr + 1u) ^ cbx]) << 8);\n"
+"        uint a, r, g, b;\n"
+"        if (cbf == 4u) {\n"
+"            a = 0xffu; r = (v >> 11) & 0x1fu; r = (r << 3) | (r >> 2);\n"
+"            g = (((v >> 5) & 0x3fu) << 2) | ((v >> 9) & 3u);\n"
+"            b = v & 0x1fu; b = (b << 3) | (b >> 2);\n"
+"        } else if (cbf == 15u) {\n"
+"            a = ((v >> 12) & 0xfu) * 0x11u; r = ((v >> 8) & 0xfu) * 0x11u;\n"
+"            g = ((v >> 4) & 0xfu) * 0x11u; b = (v & 0xfu) * 0x11u;\n"
+"        } else {\n"
+"            a = ((v >> 15) & 1u) != 0u ? 0xffu : 0u;\n"
+"            r = (v >> 10) & 0x1fu; r = (r << 3) | (r >> 2);\n"
+"            g = (v >> 5) & 0x1fu; g = (g << 3) | (g >> 2);\n"
+"            b = v & 0x1fu; b = (b << 3) | (b >> 2);\n"
+"        }\n"
+"        dv = (a << 24) | (r << 16) | (g << 8) | b;\n"
+"    } else {\n"
+"        dv = lanes(vram[caddr >> 2], cbx);\n"
+"    }\n"
 "    if (u.iv[IV_BLEND] != 0) {\n"
 "        float4 d = u.iv[IV_BREAD] != 0\n"
 "                   ? float4(N255[(dv >> 16) & 0xffu], N255[(dv >> 8) & 0xffu],\n"
@@ -788,7 +1043,18 @@ static const char *mtl_body =
 "    uint argb = (o.a << 24) | (o.r << 16) | (o.g << 8) | o.b;\n"
 /* r300_write_dst(): masked channels keep what the destination holds */
 "    argb = (argb & wm) | (dv & ~wm);\n"
-"    vram[caddr >> 2] = lanes(argb, cbx);\n"
+"    if (cbf != 0u) {\n"
+/* r300_cb_pack16(), two byte stores so a neighbour in the word is untouched */
+"        uint a = argb >> 24, r = (argb >> 16) & 0xffu;\n"
+"        uint g = (argb >> 8) & 0xffu, b = argb & 0xffu, v;\n"
+"        if (cbf == 4u) v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);\n"
+"        else if (cbf == 15u) v = ((a >> 4) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);\n"
+"        else v = ((a >> 7) << 15) | ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);\n"
+"        vram8[caddr ^ cbx] = uchar(v & 0xffu);\n"
+"        vram8[(caddr + 1u) ^ cbx] = uchar(v >> 8);\n"
+"    } else {\n"
+"        vram[caddr >> 2] = lanes(argb, cbx);\n"
+"    }\n"
 "}\n";
 
 /*
@@ -798,14 +1064,22 @@ static const char *mtl_body =
  * the output becomes a reference and USK a parameter.
  */
 static const char *mtl_us_from = "out vec4 outc)";
-static const char *mtl_us_to = "thread vec4 &outc, constant vec4 *USK)";
+static const char *mtl_us_to =
+    "thread vec4 &outc, constant vec4 *USK,\n"
+    "             texture2d<uint, access::read> TX0,\n"
+    "             texture2d<uint, access::read> TX1,\n"
+    "             texture2d<uint, access::read> TX2,\n"
+    "             texture2d<uint, access::read> TX3,\n"
+    "             constant FsU &UF, constant float *N255,\n"
+    "             thread const UsIn &XI, thread bool &KILL)";
 
 /* compiled at open, so a head or body that will not build says so then */
 static const char *mtl_us_probe =
-"void us_main(vec4 tex0, vec4 col0, vec4 col1,\n"
+"void us_main(vec4 tex0, vec4 col0, vec4 col1, vec4 tex1, vec4 tex2,\n"
+"             vec4 tex3,\n"
 "             out vec4 outc)\n"
 "{\n"
-"    precise vec4 R0 = col0;\n"
+"    precise vec4 R0 = col0 * tex1 * tex2 * tex3;\n"
 "    R0.rgb = clamp(R0.rgb * tex0.rgb + USK[0].rgb, 0.0, 1.0);\n"
 "    outc = vec4(R0.rgb, inversesqrt(abs(col1.a) + 1.0));\n"
 "}\n";
@@ -886,20 +1160,21 @@ static id<MTLRenderPipelineState> mtl_build(R350MtlCtx *g, const char *us,
         "#define OFF_T0 %d\n#define OFF_T1 %d\n#define OFF_T2 %d\n"
         "#define OFF_INV %d\n"
         "#define OFF_S0 %d\n#define OFF_S1 %d\n#define OFF_S2 %d\n"
-        "#define OFF_Z %d\n",
+        "#define OFF_Z %d\n#define OFF_RAW %d\n",
         R350_GL_VSTRIDE,
         6 + 2 * C, 8 + 2 * C, 10 + 2 * C,
         12 + 2 * C, 16 + 2 * C, 20 + 2 * C,
         24 + 2 * C, 24 + 4 * C, 24 + 6 * C,
         37 + 8 * C,
         25 + 8 * C, 29 + 8 * C, 33 + 8 * C,
-        41 + 8 * C);
+        41 + 8 * C, 45 + 8 * C);
+    g_string_append(s, mtl_body);
     g_string_append(s, "#define precise\n#define clamp r3_clamp\n");
     g_string_append_len(s, us, hook - us);
     g_string_append(s, mtl_us_to);
     g_string_append(s, hook + strlen(mtl_us_from));
     g_string_append(s, "\n#undef clamp\n#undef precise\n");
-    g_string_append(s, mtl_body);
+    g_string_append(s, mtl_body2);
 
     opt = [[MTLCompileOptions alloc] init];
     mtl_exact_math(opt);
@@ -953,7 +1228,8 @@ static void mtl_reap(R350MtlCtx *g, bool all)
         }
         st = f->cb.status;
         if (st != MTLCommandBufferStatusCompleted &&
-            st != MTLCommandBufferStatusError) {
+            st != MTLCommandBufferStatusError &&
+            f->serial > __atomic_load_n(&g->hw_done, __ATOMIC_ACQUIRE)) {
             break;
         }
         if (st == MTLCommandBufferStatusError && !g->failed) {
@@ -1020,12 +1296,23 @@ static bool mtl_submit(R350MtlCtx *g, bool wait)
             [g->fl[g->fl_head].cb waitUntilCompleted];
             mtl_reap(g, false);
         }
-        if (g->notify) {
+        {
             void (*fn)(void *) = g->notify;
             void *op = g->notify_op;
+            uint64_t *hw = &g->hw_done;
+            uint64_t sn = g->serial;
 
             [g->cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
-                fn(op);
+                uint64_t cur = __atomic_load_n(hw, __ATOMIC_RELAXED);
+
+                while (cur < sn &&
+                       !__atomic_compare_exchange_n(hw, &cur, sn, false,
+                                                    __ATOMIC_RELEASE,
+                                                    __ATOMIC_RELAXED)) {
+                }
+                if (fn) {
+                    fn(op);
+                }
             }];
         }
         [g->cb commit];
@@ -1070,7 +1357,7 @@ static id<MTLRenderCommandEncoder> mtl_enc(R350MtlCtx *g, int w, int h)
         [g->enc setViewport:vp];
         g->enc_pso = nil;
         g->enc_vb = nil;
-        g->enc_tex = nil;
+        g->enc_tex[0] = g->enc_tex[1] = g->enc_tex[2] = g->enc_tex[3] = nil;
         g->enc_vw = w;
         g->enc_vh = h;
         g->passes++;
@@ -1207,7 +1494,7 @@ void ati_r350_gl_close(R350MtlCtx *g)
         for (k = 0; k < MTL_PROGSLOTS; k++) {
             [g->prog[k].pso release];
         }
-        for (k = 0; k <= R350_GL_TEXSLOTS; k++) {
+        for (k = 0; k < R350_GL_TEXSLOTS + 4; k++) {
             [g->tex[k] release];
         }
         [g->arena_free release];
@@ -1401,9 +1688,9 @@ static id<MTLRenderPipelineState> mtl_prog_for(R350MtlCtx *g,
     return sl->pso;
 }
 
-static int mtl_levels(const R350GlReq *r)
+static int mtl_levels(const R350GlReq *r, unsigned i)
 {
-    return r->filt[0][0] ? MAX(r->levels[0], 1) : 1;
+    return r->filt[i][0] ? MAX(r->levels[i], 1) : 1;
 }
 
 /*
@@ -1412,10 +1699,11 @@ static int mtl_levels(const R350GlReq *r)
  * gets a NEW texture rather than being overwritten under it; the old one
  * lives on in the buffers that use it.
  */
-static bool mtl_upload(R350MtlCtx *g, unsigned slot, const R350GlReq *r)
+static bool mtl_upload(R350MtlCtx *g, unsigned slot, const R350GlReq *r,
+                       unsigned i)
 {
-    int nl = mtl_levels(r), w0 = r->tex_w[0], h0 = r->tex_h[0], l, full;
-    const uint8_t *p = r->tex[0];
+    int nl = mtl_levels(r, i), w0 = r->tex_w[i], h0 = r->tex_h[i], l, full;
+    const uint8_t *p = r->tex[i];
 
     if (w0 <= 0 || h0 <= 0 || w0 > 16384 || h0 > 16384) {
         return false;
@@ -1461,14 +1749,17 @@ static bool mtl_upload(R350MtlCtx *g, unsigned slot, const R350GlReq *r)
     return true;
 }
 
+/* why a draw was handed back (gl-stats "metal declined"); see ati_r350_gl.h */
+uint64_t r350_mtl_decline[R350_MTL_DECLINE_N];
+
 bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
 {
     id<MTLRenderPipelineState> pso;
     id<MTLRenderCommandEncoder> enc;
-    id<MTLTexture> tex = nil;
+    id<MTLTexture> tex[4] = { nil, nil, nil, nil };
     id<MTLBuffer> vb;
     size_t vlen, voff = 0;
-    unsigned slot = R350_GL_TEXSLOTS + 1, k;
+    unsigned slot[4], k;
     int sx0, sy0, sx1, sy1;
     float rect[4];
     MtlFsU fu;
@@ -1477,28 +1768,61 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
     if (!g || !g->vbuf || r->out || r->w <= 0 || r->h <= 0 || !r->nvert ||
         !r->us_glsl || r->surf_w <= 0 || r->surf_h <= 0 ||
         r->surf_w > 16384 || r->surf_h > 16384 || g->failed) {
+        r350_mtl_decline[0]++;
         return false;
     }
     @autoreleasepool {
         pso = mtl_prog_for(g, r);
         if (!pso) {
+            r350_mtl_decline[1]++;
             return false;               /* the caller renders it instead */
         }
-        if ((r->textured & 1) && r->tex_slot[0] <= R350_GL_TEXSLOTS) {
-            slot = r->tex_slot[0];
-            if (r->tex_fresh[0] && r->tex[0]) {
-                if (!mtl_upload(g, slot, r)) {
+        /*
+         * The fetches' units, r->textured bits 0-3, in fetch order. An
+         * untracked texture (the caller's scratch slot) of fetch k > 0
+         * goes to a scratch of its own, so two of them in one draw do
+         * not overwrite each other's upload.
+         */
+        for (k = 0; k < 4; k++) {
+            slot[k] = R350_GL_TEXSLOTS + 4;
+        }
+        for (k = 0; k < 4; k++) {
+            if (((r->textured >> k) & 1) &&
+                r->tex_slot[k] <= R350_GL_TEXSLOTS) {
+                slot[k] = r->tex_slot[k];
+                /* an untracked texture of fetch k > 0: its own scratch */
+                if (slot[k] == R350_GL_TEXSLOTS && k) {
+                    slot[k] = R350_GL_TEXSLOTS + k;
+                }
+                bool stale = !g->tex[slot[k]] ||
+                             g->tex_w[slot[k]] != r->tex_w[k] ||
+                             g->tex_h[slot[k]] != r->tex_h[k] ||
+                             g->tex_nl[slot[k]] != mtl_levels(r, k);
+
+                /*
+                 * The caller marks a slot uploaded when it hands the
+                 * texels out, and a draw that then falls back before it
+                 * reaches here leaves that mark on a slot we never
+                 * filled. The texels come with every request, so a slot
+                 * that does not match is simply uploaded now rather than
+                 * the draw refused (it was, again and again, in Halo).
+                 */
+                if ((r->tex_fresh[k] || stale) && r->tex[k]) {
+                    r350_mtl_decline[5] += !r->tex_fresh[k];
+                    if (!mtl_upload(g, slot[k], r, k)) {
+                        r350_mtl_decline[2]++;
+                        return false;
+                    }
+                } else if (stale) {
+                    r350_mtl_decline[3]++;
                     return false;
                 }
-            } else if (!g->tex[slot] || g->tex_w[slot] != r->tex_w[0] ||
-                       g->tex_h[slot] != r->tex_h[0] ||
-                       g->tex_nl[slot] != mtl_levels(r)) {
-                /* the caller's bookkeeping and ours disagree: refuse */
-                return false;
             }
-            tex = g->tex[slot];
-        } else {
-            tex = g->white;
+        }
+        /* bound after every upload: an upload may replace a slot's object */
+        for (k = 0; k < 4; k++) {
+            tex[k] = slot[k] < R350_GL_TEXSLOTS + 4 ? g->tex[slot[k]]
+                                                     : g->white;
         }
 
         /* scissor, the draw's rectangle, and the raster's bounds */
@@ -1511,6 +1835,7 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
             vlen = sizeof(float) * R350_GL_VSTRIDE * r->nvert;
             vb = mtl_alloc(g, vlen, &voff);
             if (!vb) {
+                r350_mtl_decline[4]++;
                 return false;
             }
             memcpy((uint8_t *)vb.contents + voff, r->verts, vlen);
@@ -1527,11 +1852,32 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
             for (k = 0; k < 4; k++) {
                 fu.tf[11 + k] = r->border[0][k];
             }
+            fu.tf[15] = r->filt[0][11];
             fu.iv[IV_TEXW] = r->tex_w[0];
             fu.iv[IV_TEXH] = r->tex_h[0];
             fu.iv[IV_CLAMPS] = r->clamp_s[0];
             fu.iv[IV_CLAMPT] = r->clamp_t[0];
             fu.iv[IV_TEXTURED] = r->textured & 1;
+            fu.iv[IV_TEXTURED1] = (r->textured >> 1) & 1;
+            fu.iv[IV_TEXTURED2] = (r->textured >> 2) & 1;
+            memcpy(fu.sinv, r->set_inv, sizeof(fu.sinv));
+            fu.rawx = (int32_t)r->tc_raw;
+            fu.iv[IV_TEXTURED3] = (r->textured >> 3) & 1;
+            for (k = 1; k < 4; k++) {
+                unsigned j;
+
+                for (j = 0; j < 11; j++) {
+                    fu.tfx[k - 1][j] = r->filt[k][j];
+                }
+                for (j = 0; j < 4; j++) {
+                    fu.tfx[k - 1][11 + j] = r->border[k][j];
+                }
+                fu.tfx[k - 1][15] = r->filt[k][11];
+                fu.tvx[k - 1][0] = r->tex_w[k];
+                fu.tvx[k - 1][1] = r->tex_h[k];
+                fu.tvx[k - 1][2] = r->clamp_s[k];
+                fu.tvx[k - 1][3] = r->clamp_t[k];
+            }
             fu.iv[IV_ATEST] = r->alpha_test;
             fu.iv[IV_AFUNC] = r->af_func;
             fu.iv[IV_DISCARD] = r->discard;
@@ -1563,6 +1909,7 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
             fu.iv[IV_ZAA] = r->z_aa;
             fu.iv[IV_ZX] = (int32_t)r->z_xr;
             fu.iv[IV_VSZ] = (int32_t)g->vsz;
+            fu.iv[IV_CBFMT] = (int32_t)r->cb_fmt;
             rect[0] = 0.0f;
             rect[1] = 0.0f;
             rect[2] = (float)r->surf_w;
@@ -1575,13 +1922,17 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
             }
             if (g->enc_vb != vb) {
                 [enc setVertexBuffer:vb offset:voff atIndex:0];
+                [enc setFragmentBuffer:vb offset:voff atIndex:5];
                 g->enc_vb = vb;
             } else {
                 [enc setVertexBufferOffset:voff atIndex:0];
+                [enc setFragmentBufferOffset:voff atIndex:5];
             }
-            if (g->enc_tex != tex) {
-                [enc setFragmentTexture:tex atIndex:0];
-                g->enc_tex = tex;
+            for (k = 0; k < 4; k++) {
+                if (g->enc_tex[k] != tex[k]) {
+                    [enc setFragmentTexture:tex[k] atIndex:k];
+                    g->enc_tex[k] = tex[k];
+                }
             }
             [enc setVertexBytes:rect length:sizeof(rect) atIndex:1];
             [enc setFragmentBytes:&fu length:sizeof(fu) atIndex:0];
@@ -1606,8 +1957,10 @@ bool ati_r350_gl_draw(R350MtlCtx *g, const R350GlReq *r)
             [enc drawPrimitives:MTLPrimitiveTypeTriangle
                     vertexStart:0
                     vertexCount:r->nvert];
-            if (slot <= R350_GL_TEXSLOTS) {
-                g->tex_use[slot] = g->serial;
+            for (k = 0; k < 4; k++) {
+                if (slot[k] < R350_GL_TEXSLOTS + 4) {
+                    g->tex_use[slot[k]] = g->serial;
+                }
             }
             g->draws++;
             if (++g->cb_draws >= MTL_CB_DRAWS) {

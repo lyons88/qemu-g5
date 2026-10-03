@@ -346,6 +346,47 @@ typedef struct R300UsProgram {
      */
     bool gl_simple;
     /*
+     * The same shape with the one fetch from ANY bound unit -- what the
+     * GL translator accepts. The backend samples a single texture in
+     * front of the program; gl_prims() hands it unit `gl_unit`'s. JK2
+     * leaves unit 0 disabled and draws its menus and cinematics from
+     * unit 1 alone (TX_ENABLE 0x2).
+     */
+    bool gl_simple_any;
+    unsigned gl_unit;
+    /*
+     * The multi-texture shape, for a backend that samples two units in
+     * front of the program (Metal): ONE level, no TEXKILL, up to TWO
+     * fetches, each addressed directly by an interpolated coordinate set
+     * below R300_GL_FETCH_SETS. Quake 3-engine lightmapped surfaces are
+     * this: texel x lightmap, units 0 and 1, sets 0 and 1.
+     *
+     * Up to FOUR now (Halo's world shaders fetch units 0-3): fetch k
+     * samples unit gl_funit[k] with coordinate set gl_fset[k] into frame
+     * register gl_fdst[k]. gl_nfetch: 0..4.
+     */
+    bool gl_multi;
+    /*
+     * Everything else the interpreter can run, for a backend that
+     * samples INSIDE the program (Metal): any number of levels, dependent
+     * reads, TEXKILL, any fetch count -- as long as every fetch names a
+     * unit below four and the routing uses coordinate sets 0-3 only.
+     */
+    bool gl_general;
+    unsigned gl_nfetch;
+    unsigned gl_funit[4], gl_fset[4];
+    int gl_fdst[4];
+    /*
+     * gl_general's texture slots: the program's distinct LD/PROJ units,
+     * up to four, packed into the backend's four bindings in order of
+     * first use. gl_gslot[unit] is the binding a fetch from `unit`
+     * samples; gl_gunit[slot] the unit bound there. gl_gwhy: why
+     * gl_general was refused (0 other, 1 more than four units, 2 a
+     * coordinate set above 3).
+     */
+    unsigned gl_gunit[4], gl_ngen, gl_gwhy;
+    uint8_t gl_gslot[R300_TEX_UNITS];
+    /*
      * The one texture fetch, resolved: which frame register receives the
      * texel, and -1 when the program fetches nothing. A program with more
      * than one live fetch, or one naming a unit other than 0, is refused
@@ -530,6 +571,14 @@ static inline void r300_us_run_fast(const R300UsProgram *p,
  * false, without writing a usable shader, for anything
  * `p->expressible` refuses.
  */
-bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap);
+/*
+ * `multi`: the backend samples up to two units with any of the first
+ * R300_GL_FETCH_SETS coordinate sets (Metal); the emitted us_main() then
+ * takes a fourth texel and the text opens with US_TC0/US_TC1 defines.
+ */
+#define R300_GL_FETCH_SETS 4
+#define R300_GL_FETCHES    4
+bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap, bool multi,
+                  bool force_gen);
 
 #endif /* ATI_R350_US_H */
