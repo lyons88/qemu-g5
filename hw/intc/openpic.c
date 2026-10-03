@@ -725,6 +725,18 @@ static void qemu_timer_cb(void *opaque)
 static void openpic_tmr_set_tmr(OpenPICTimer *tmr, uint32_t val, bool enabled)
 {
     uint64_t ns = ticks_to_ns(val & ~TCCR_TOG);
+
+    /*
+     * Only the Freescale init creates the timers, but every model maps the
+     * timer registers: a guest that writes TBCR on a KeyLargo/U3 MPIC
+     * reached timer_mod()/timer_del() on the NULL timer and segfaulted.
+     * A model with no timers has none to arm (its timer has no IRQ or
+     * back-pointer either): keep the register state and do nothing.
+     */
+    if (!tmr->qemu_timer) {
+        tmr->qemu_timer_active = false;
+        return;
+    }
     /*
      * A count of zero causes a timer to be set to expire immediately.  This
      * effectively stops the simulation since the timer is constantly expiring
