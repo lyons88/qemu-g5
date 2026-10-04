@@ -128,10 +128,14 @@ typedef struct MtlFsU {
     int32_t tvx[3][4];
     float sinv[4][2];           /* 1/size each coordinate set is carried in */
     int32_t rawx;               /* sets read raw this draw (cube maps) */
+    /* MSL's FsU starts with a float4, so Metal rounds its size up to a
+     * multiple of 16 (544); setFragmentBytes must pass all of it. */
+    int32_t pad_tail[3];
 } MtlFsU;
 
 QEMU_BUILD_BUG_ON(IV_TEXTURED3 >= IV_N);
-QEMU_BUILD_BUG_ON(sizeof(MtlFsU) != 32 + 64 + 4 * IV_N + 3 * 64 + 3 * 16 + 32 + 4);
+QEMU_BUILD_BUG_ON(sizeof(MtlFsU) != 32 + 64 + 4 * IV_N + 3 * 64 + 3 * 16 + 32 + 4 + 12);
+QEMU_BUILD_BUG_ON(sizeof(MtlFsU) % 16 != 0);
 
 struct R350MtlCtx {
     id<MTLDevice> dev;
