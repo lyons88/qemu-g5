@@ -31,7 +31,7 @@
 /* FIFO depth a (re)started stream waits for, and how long it waits */
 #define K2_I2S_PREBUF_NS            (60 * 1000 * 1000)
 #define K2_I2S_PREBUF_GIVEUP_NS     (100 * 1000 * 1000)
-/* How far descriptor retirement may fall behind real time */
+/* How far descriptor retirement may fall behind real time (default) */
 #define K2_I2S_MAX_DEBT_NS          (10 * 1000 * 1000)
 
 static uint32_t k2_fcr1(K2SoundState *s)
@@ -245,7 +245,33 @@ static void k2_i2s_audio_cb(void *opaque, int avail)
     K2SoundState *s = opaque;
     int fb = s->voice_frame_bytes;
 
+    s->st_cb++;
+    s->st_fifo_min = MIN(s->st_fifo_min, s->fifo_count);
+    s->st_fifo_max = MAX(s->st_fifo_max, s->fifo_count);
+    if (s->fifo_count < (uint32_t)avail) {
+        s->st_cb_short++;
+    }
+    /*
+     * audio-low-ms: a FIFO pushed this low by a stall stays that low --
+     * the guest only ever feeds at the rate it plays -- and every host
+     * callback then finds less than it asks for, which plays as constant
+     * popping. Go back to prebuffering instead: one gap of silence, then
+     * the full cushion again.
+     */
+    if (!s->prebuffering && s->low_bytes && s->fifo_count &&
+        s->fifo_count < s->low_bytes) {
+        s->st_prebuf++;
+        s->st_silence += avail;
+        s->prebuffering = true;
+        k2_i2s_write_silence(s, avail);
+        return;
+    }
     if (s->fifo_count == 0) {
+        s->st_cb_empty++;
+        if (!s->prebuffering) {
+            s->st_prebuf++;
+        }
+        s->st_silence += avail;
         s->prebuffering = true;
         k2_i2s_write_silence(s, avail);
         return;
@@ -309,6 +335,7 @@ static void k2_i2s_tap_out(K2SoundState *s, DBDMA_io *io, int rate)
 
         s->voice_rate = rate;
         s->voice_frame_bytes = fb;
+        s->low_bytes = (uint64_t)rate * fb * s->low_ms / 1000;
         s->fifo_rptr = s->fifo_wptr = s->fifo_count = 0;
         s->voice = audio_be_open_out(s->audio_be, s->voice, "tas3004.out",
                                      s, k2_i2s_audio_cb, &as);
@@ -328,6 +355,7 @@ static void k2_i2s_tap_out(K2SoundState *s, DBDMA_io *io, int rate)
             s->fifo_wptr = (s->fifo_wptr + 1) % sizeof(s->out_fifo);
             s->fifo_count++;
         }
+        s->st_drop += len - i;
         addr += len;
         remaining -= len;
     }
@@ -340,6 +368,15 @@ static void k2_i2s_dir_complete(void *opaque)
 
     d->pending = NULL;
     if (io) {
+        K2SoundState *s = io->opaque;
+
+        if (io->is_dma_out) {
+            int64_t late = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                           d->deadline_ns;
+
+            s->st_late_max = MAX(s->st_late_max, late);
+            s->st_late_sum += late;
+        }
         io->dma_end(io);
     }
 }
@@ -357,14 +394,26 @@ static void k2_i2s_dma_rw(DBDMA_io *io)
 
     if (io->is_dma_out) {
         s->walk_frames += frames;
+        s->st_desc++;
         k2_i2s_tap_out(s, io, rate);
     } else {
         dma_memory_set(io->as, io->addr, 0, io->len,
                        MEMTXATTRS_UNSPECIFIED);
     }
 
-    if (d->deadline_ns < now - K2_I2S_MAX_DEBT_NS) {
-        d->deadline_ns = now - K2_I2S_MAX_DEBT_NS;
+    /*
+     * After a stall (timers held up by a busy main loop) retirement may
+     * run this far behind real time and catch up; anything older is
+     * thrown away. Thrown-away time is audio the guest is never asked
+     * for, so the host FIFO is left that much lower for good.
+     */
+    if (d->deadline_ns == 0) {
+        d->deadline_ns = now;           /* a (re)started stream owes nothing */
+    } else if (d->deadline_ns < now - s->max_debt_ns) {
+        if (io->is_dma_out) {
+            s->st_debt_ns += now - s->max_debt_ns - d->deadline_ns;
+        }
+        d->deadline_ns = now - s->max_debt_ns;
     }
     d->deadline_ns += (int64_t)frames * NANOSECONDS_PER_SECOND / rate;
     if (d->deadline_ns <= now) {
@@ -437,4 +486,63 @@ void k2_sound_init(K2SoundState *s, DeviceState *owner, MemoryRegion *bar)
                                        k2_i2s_dir_complete, &s->dir[i]);
     }
     k2_sound_reset(s);
+}
+
+/*
+ * audio-log=FILE (on macio-newworld): one line a second of the output path's
+ * timing, to tell a late guest/timer (DMA paced too slowly, debt dropped)
+ * from a starved or overfull host FIFO.
+ *   desc     output DMA descriptors retired
+ *   late     timer lateness at retirement, average and worst, microseconds
+ *   debt     output time thrown away by the MAX_DEBT clamp, milliseconds
+ *   cb       host audio callbacks; short = FIFO had less than asked;
+ *            empty = FIFO empty; refill = fell back into prebuffering
+ *   silence  bytes of silence written to the host
+ *   drop     guest bytes dropped because the FIFO was full
+ *   fifo     FIFO level seen by the callbacks, min..max, milliseconds
+ */
+static void k2_sound_log_tick(void *opaque)
+{
+    K2SoundState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    double bpms = s->voice_rate > 0 && s->voice_frame_bytes > 0 ?
+                  s->voice_rate * s->voice_frame_bytes / 1000.0 : 0.0;
+
+    fprintf(s->log, "t=%.1f desc=%" PRIu64 " late_avg=%" PRId64 "us "
+            "late_max=%" PRId64 "us debt=%.1fms cb=%" PRIu64 " short=%" PRIu64
+            " empty=%" PRIu64 " refill=%" PRIu64 " silence=%" PRIu64
+            " drop=%" PRIu64 " fifo=%.1f..%.1fms\n",
+            (now - s->log_t0) / 1e9, s->st_desc,
+            s->st_desc ? s->st_late_sum / (int64_t)s->st_desc / 1000 : 0,
+            s->st_late_max / 1000, s->st_debt_ns / 1e6, s->st_cb,
+            s->st_cb_short, s->st_cb_empty, s->st_prebuf, s->st_silence,
+            s->st_drop,
+            bpms ? (s->st_fifo_min == UINT32_MAX ? 0 : s->st_fifo_min) / bpms
+                 : 0.0,
+            bpms ? s->st_fifo_max / bpms : 0.0);
+    fflush(s->log);
+    s->st_desc = s->st_cb = s->st_cb_short = s->st_cb_empty = 0;
+    s->st_silence = s->st_drop = s->st_prebuf = s->st_debt_ns = 0;
+    s->st_late_max = s->st_late_sum = 0;
+    s->st_fifo_min = UINT32_MAX;
+    s->st_fifo_max = 0;
+    timer_mod(s->log_timer, now + NANOSECONDS_PER_SECOND);
+}
+
+void k2_sound_start_log(K2SoundState *s, const char *path)
+{
+    s->st_fifo_min = UINT32_MAX;
+    if (!s->max_debt_ns) {
+        s->max_debt_ns = K2_I2S_MAX_DEBT_NS;
+    }
+    if (!path || !path[0]) {
+        return;
+    }
+    s->log = fopen(path, "w");
+    if (!s->log) {
+        return;
+    }
+    s->log_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    s->log_timer = timer_new_ns(QEMU_CLOCK_REALTIME, k2_sound_log_tick, s);
+    timer_mod(s->log_timer, s->log_t0 + NANOSECONDS_PER_SECOND);
 }

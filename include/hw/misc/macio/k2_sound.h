@@ -63,11 +63,24 @@ typedef struct K2SoundState {
     uint32_t fifo_count;
     bool prebuffering;
     int64_t last_push_ns;
+    int64_t max_debt_ns;        /* audio-catchup-ms on macio-newworld */
+    uint32_t low_ms;            /* audio-low-ms: rebuffer below this */
+    uint32_t low_bytes;
+
+    /* audio-log: per-second timing statistics (see k2_sound_start_log) */
+    FILE *log;
+    QEMUTimer *log_timer;
+    int64_t log_t0;
+    uint64_t st_desc, st_cb, st_cb_short, st_cb_empty, st_silence;
+    uint64_t st_drop, st_prebuf, st_debt_ns;
+    int64_t st_late_max, st_late_sum;
+    uint32_t st_fifo_min, st_fifo_max;
 } K2SoundState;
 
 void k2_sound_init(K2SoundState *s, DeviceState *owner, MemoryRegion *bar);
 void k2_sound_register_dma(K2SoundState *s, void *dbdma,
                            qemu_irq tx_irq, qemu_irq rx_irq);
 void k2_sound_reset(K2SoundState *s);
+void k2_sound_start_log(K2SoundState *s, const char *path);
 
 #endif

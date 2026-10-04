@@ -304,6 +304,9 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
 
         k2_sound_init(&ns->sound, DEVICE(d), &s->bar);
         ns->sound.audio_be = ns->audio_be;
+        ns->sound.max_debt_ns = (int64_t)ns->audio_catchup_ms * 1000000;
+        ns->sound.low_ms = ns->audio_low_ms;
+        k2_sound_start_log(&ns->sound, ns->audio_log);
         ns->sound.codec = i2c_slave_create_simple(ns->i2c.bus, TYPE_TAS3004,
                                                   TAS3004_I2C_ADDR);
         i2c_slave_create_simple(ns->i2c.bus, TYPE_CS8420, CS8420_I2C_ADDR);
@@ -458,6 +461,10 @@ static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
     DEFINE_PROP_BOOL("k2", NewWorldMacIOState, k2, false),
+    DEFINE_PROP_STRING("audio-log", NewWorldMacIOState, audio_log),
+    DEFINE_PROP_UINT32("audio-catchup-ms", NewWorldMacIOState,
+                       audio_catchup_ms, 10),
+    DEFINE_PROP_UINT32("audio-low-ms", NewWorldMacIOState, audio_low_ms, 20),
     DEFINE_AUDIO_PROPERTIES(NewWorldMacIOState, audio_be),
 };
 
