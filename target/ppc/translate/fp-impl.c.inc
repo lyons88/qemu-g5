@@ -11,6 +11,16 @@ static inline void gen_reset_fpstatus(void)
 
 static inline void gen_compute_fprf_float64(TCGv_i64 arg)
 {
+    /*
+     * fpscr-lazy: leave FPRF and the FPSCR status bits alone after
+     * arithmetic. Invalid-operation and divide-by-zero are still handled
+     * inside each helper; FPRF, FR/FI and the sticky OX/UX/XX bits go
+     * stale, and an enabled overflow/underflow/inexact exception is not
+     * raised.
+     */
+    if (ppc_fpscr_lazy) {
+        return;
+    }
     gen_helper_compute_fprf_float64(tcg_env, arg);
     gen_helper_float_check_status(tcg_env);
 }

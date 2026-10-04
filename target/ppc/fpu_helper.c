@@ -475,7 +475,15 @@ void helper_float_check_status(CPUPPCState *env)
 
 void helper_reset_fpstatus(CPUPPCState *env)
 {
-    set_float_exception_flags(0, &env->fp_status);
+    /*
+     * fp-hardfloat: start each operation with "inexact" already raised,
+     * which is what softfloat needs before it will use the host FPU. Costs
+     * FPSCR accuracy: FI reads 1 and XX stays set after every operation,
+     * and a guest that enables the inexact exception (FPSCR[XE]) would
+     * trap on every one.
+     */
+    set_float_exception_flags(env_archcpu(env)->fp_hardfloat ?
+                              float_flag_inexact : 0, &env->fp_status);
 }
 
 static void float_invalid_op_addsub(CPUPPCState *env, int flags,

@@ -1530,6 +1530,16 @@ struct ArchCPU {
     int32_t node_id; /* NUMA node this CPU belongs to */
     PPCHash64Options *hash64_opts;
     bool rtas_stopped_state;
+    /*
+     * Fast floating point, each off unless set on the command line with
+     * -global powerpc64-cpu.<name>=on:
+     *   fp-hardfloat  scalar FP math on the host FPU (single precision too)
+     *   vmx-hardfloat AltiVec vaddfp/vsubfp/vmaddfp/vnmsubfp on the host FPU
+     *   fpscr-lazy    skip FPRF and FPSCR status updates after arithmetic
+     */
+    bool fp_hardfloat;
+    bool vmx_hardfloat;
+    bool fpscr_lazy;
 
     /* Those resources are used only during code translation */
     /* opcode handlers */

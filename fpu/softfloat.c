@@ -1738,13 +1738,64 @@ static float64 float64r32_addsub(float64 a, float64 b, float_status *status,
     return float64r32_round_pack_canonical(&pr, status);
 }
 
+/*
+ * Host-FPU path for the PowerPC single-precision operations (fadds,
+ * fmuls, fdivs, fmadds...), which take and return doubles but round to
+ * single. Used only under the same condition as every other hardfloat
+ * path -- can_use_fpu(): round-to-nearest with "inexact" already
+ * raised -- and only for zero-or-normal inputs whose result is a normal
+ * single or zero; everything else (NaN, infinity, denormal, overflow,
+ * underflow) takes the softfloat path and its exact flags. The result is
+ * computed in double and rounded to single, so a value exactly halfway
+ * between two singles after the double rounding can differ in its last
+ * bit from a single correctly-rounded step.
+ */
+static inline bool f64r32_hard_ok(double r, union_float64 *out)
+{
+    float f;
+
+    if (unlikely(r != 0.0 && fabs(r) < FLT_MIN)) {
+        return false;                   /* underflow: softfloat */
+    }
+    f = (float)r;
+    if (unlikely(isinf(f))) {
+        return false;                   /* overflow: softfloat */
+    }
+    out->h = f;
+    return true;
+}
+
+static inline bool f64r32_hard2(float64 a, float64 b, float_status *s,
+                                union_float64 *ua, union_float64 *ub)
+{
+    if (!can_use_fpu(s)) {
+        return false;
+    }
+    ua->s = a;
+    ub->s = b;
+    float64_input_flush2(&ua->s, &ub->s, s);
+    return f64_is_zon2(*ua, *ub);
+}
+
 float64 float64r32_add(float64 a, float64 b, float_status *status)
 {
+    union_float64 ua, ub, ur;
+
+    if (f64r32_hard2(a, b, status, &ua, &ub) &&
+        f64r32_hard_ok(ua.h + ub.h, &ur)) {
+        return ur.s;
+    }
     return float64r32_addsub(a, b, status, false);
 }
 
 float64 float64r32_sub(float64 a, float64 b, float_status *status)
 {
+    union_float64 ua, ub, ur;
+
+    if (f64r32_hard2(a, b, status, &ua, &ub) &&
+        f64r32_hard_ok(ua.h - ub.h, &ur)) {
+        return ur.s;
+    }
     return float64r32_addsub(a, b, status, true);
 }
 
@@ -1871,6 +1922,13 @@ float64_mul(float64 a, float64 b, float_status *s)
 
 float64 float64r32_mul(float64 a, float64 b, float_status *status)
 {
+    union_float64 ua, ub, ur;
+
+    if (f64r32_hard2(a, b, status, &ua, &ub) &&
+        f64r32_hard_ok(ua.h * ub.h, &ur)) {
+        return ur.s;
+    }
+
     FloatParts64 pa = float64_unpack_canonical(a, status);
     FloatParts64 pb = float64_unpack_canonical(b, status);
     FloatParts64 pr = parts64_mul(&pa, &pb, status);
@@ -2128,6 +2186,31 @@ float64_muladd(float64 xa, float64 xb, float64 xc, int flags, float_status *s)
 float64 float64r32_muladd(float64 a, float64 b, float64 c,
                           int flags, float_status *status)
 {
+    union_float64 ua, ub, uc, ur;
+
+    if (!(flags & ~(float_muladd_negate_c | float_muladd_negate_product |
+                    float_muladd_negate_result)) &&
+        f64r32_hard2(a, b, status, &ua, &ub)) {
+        uc.s = c;
+        float64_input_flush1(&uc.s, status);
+        if (f64_is_zon2(uc, uc)) {
+            double pa = ua.h, pc = uc.h;
+
+            if (flags & float_muladd_negate_product) {
+                pa = -pa;
+            }
+            if (flags & float_muladd_negate_c) {
+                pc = -pc;
+            }
+            if (f64r32_hard_ok(fma(pa, ub.h, pc), &ur)) {
+                if (flags & float_muladd_negate_result) {
+                    ur.h = -ur.h;
+                }
+                return ur.s;
+            }
+        }
+    }
+
     FloatParts64 pa = float64_unpack_canonical(a, status);
     FloatParts64 pb = float64_unpack_canonical(b, status);
     FloatParts64 pc = float64_unpack_canonical(c, status);
@@ -2266,6 +2349,13 @@ float64_div(float64 a, float64 b, float_status *s)
 
 float64 float64r32_div(float64 a, float64 b, float_status *status)
 {
+    union_float64 ua, ub, ur;
+
+    if (f64r32_hard2(a, b, status, &ua, &ub) && ub.h != 0.0 &&
+        f64r32_hard_ok(ua.h / ub.h, &ur)) {
+        return ur.s;
+    }
+
     FloatParts64 pa = float64_unpack_canonical(a, status);
     FloatParts64 pb = float64_unpack_canonical(b, status);
     FloatParts64 pr = parts64_div(&pa, &pb, status);

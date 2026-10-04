@@ -57,6 +57,9 @@
 static const Property powerpc_cpu_properties[] = {
     DEFINE_PROP_BOOL("rtas-stopped-state", PowerPCCPU,
                       rtas_stopped_state, true),
+    DEFINE_PROP_BOOL("fp-hardfloat", PowerPCCPU, fp_hardfloat, true),
+    DEFINE_PROP_BOOL("vmx-hardfloat", PowerPCCPU, vmx_hardfloat, true),
+    DEFINE_PROP_BOOL("fpscr-lazy", PowerPCCPU, fpscr_lazy, true),
 };
 
 static inline void vscr_init(CPUPPCState *env, uint32_t val)

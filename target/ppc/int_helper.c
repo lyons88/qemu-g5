@@ -27,6 +27,8 @@
 #include "crypto/aes-round.h"
 #include "crypto/clmul.h"
 #include "fpu/softfloat.h"
+#include <math.h>
+#include <float.h>
 #include "qapi/error.h"
 #include "qemu/guest-random.h"
 #include "tcg/tcg-gvec-desc.h"
@@ -504,34 +506,130 @@ void helper_VPRTYBQ(ppc_avr_t *r, ppc_avr_t *b, uint32_t v)
     r->VsrD(0) = 0;
 }
 
-#define VARITHFP(suffix, func)                                          \
+/*
+ * vmx-hardfloat: the four lanes on the host FPU when every input is zero or
+ * normal and every result is zero or a normal single; otherwise (NaN,
+ * infinity, denormal, overflow, underflow) all four lanes take softfloat.
+ * AltiVec keeps no exception flags, so the host result is exact for the
+ * guest. AltiVec arithmetic always rounds to nearest.
+ */
+static inline bool vmx_zon(float32 v)
+{
+    uint32_t e = (v >> 23) & 0xff;
+
+    return e != 0xff && (e != 0 || (v & 0x7fffff) == 0);
+}
+
+static inline bool vmx_res_ok(float r)
+{
+    return !isinf(r) && (r == 0.0f || fabsf(r) >= FLT_MIN);
+}
+
+static inline float vmx_f(float32 v)
+{
+    float f;
+
+    memcpy(&f, &v, 4);
+    return f;
+}
+
+static inline float32 vmx_u(float f)
+{
+    float32 v;
+
+    memcpy(&v, &f, 4);
+    return v;
+}
+
+static bool vmx_hard2(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a,
+                      ppc_avr_t *b, int op)
+{
+    float t[4];
+    int i;
+
+    if (!env_archcpu(env)->vmx_hardfloat) {
+        return false;
+    }
+    for (i = 0; i < 4; i++) {
+        if (!vmx_zon(a->f32[i]) || !vmx_zon(b->f32[i])) {
+            return false;
+        }
+        t[i] = op ? vmx_f(a->f32[i]) - vmx_f(b->f32[i])
+                  : vmx_f(a->f32[i]) + vmx_f(b->f32[i]);
+        if (!vmx_res_ok(t[i])) {
+            return false;
+        }
+    }
+    for (i = 0; i < 4; i++) {
+        r->f32[i] = vmx_u(t[i]);
+    }
+    return true;
+}
+
+static bool vmx_hard_fma(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a,
+                         ppc_avr_t *b, ppc_avr_t *c, bool nmsub)
+{
+    float t[4];
+    int i;
+
+    if (!env_archcpu(env)->vmx_hardfloat) {
+        return false;
+    }
+    for (i = 0; i < 4; i++) {
+        if (!vmx_zon(a->f32[i]) || !vmx_zon(b->f32[i]) ||
+            !vmx_zon(c->f32[i])) {
+            return false;
+        }
+        /* vmaddfp: a*c + b; vnmsubfp: -(a*c - b) */
+        t[i] = nmsub ? -fmaf(vmx_f(a->f32[i]), vmx_f(c->f32[i]),
+                             -vmx_f(b->f32[i]))
+                     : fmaf(vmx_f(a->f32[i]), vmx_f(c->f32[i]),
+                            vmx_f(b->f32[i]));
+        if (!vmx_res_ok(t[i])) {
+            return false;
+        }
+    }
+    for (i = 0; i < 4; i++) {
+        r->f32[i] = vmx_u(t[i]);
+    }
+    return true;
+}
+
+#define VARITHFP(suffix, func, hard)                                    \
     void helper_v##suffix(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, \
                           ppc_avr_t *b)                                 \
     {                                                                   \
         int i;                                                          \
                                                                         \
+        if (hard >= 0 && vmx_hard2(env, r, a, b, hard)) {               \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < ARRAY_SIZE(r->f32); i++) {                      \
             r->f32[i] = func(a->f32[i], b->f32[i], &env->vec_status);   \
         }                                                               \
     }
-VARITHFP(addfp, float32_add)
-VARITHFP(subfp, float32_sub)
-VARITHFP(minfp, float32_min)
-VARITHFP(maxfp, float32_max)
+VARITHFP(addfp, float32_add, 0)
+VARITHFP(subfp, float32_sub, 1)
+VARITHFP(minfp, float32_min, -1)
+VARITHFP(maxfp, float32_max, -1)
 #undef VARITHFP
 
-#define VARITHFPFMA(suffix, type)                                       \
+#define VARITHFPFMA(suffix, type, nmsub)                                \
     void helper_v##suffix(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, \
                            ppc_avr_t *b, ppc_avr_t *c)                  \
     {                                                                   \
         int i;                                                          \
+                                                                        \
+        if (vmx_hard_fma(env, r, a, b, c, nmsub)) {                     \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < ARRAY_SIZE(r->f32); i++) {                      \
             r->f32[i] = float32_muladd(a->f32[i], c->f32[i], b->f32[i], \
                                        type, &env->vec_status);         \
         }                                                               \
     }
-VARITHFPFMA(maddfp, 0);
-VARITHFPFMA(nmsubfp, float_muladd_negate_result | float_muladd_negate_c);
+VARITHFPFMA(maddfp, 0, false);
+VARITHFPFMA(nmsubfp, float_muladd_negate_result | float_muladd_negate_c, true);
 #undef VARITHFPFMA
 
 #define VARITHSAT_CASE(type, op, cvt, element)                          \

@@ -41,6 +41,9 @@
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
+
+/* the CPU's fpscr-lazy property, read when a block is translated */
+static bool ppc_fpscr_lazy;
 #undef  HELPER_H
 
 #define CPU_SINGLE_STEP 0x1
@@ -4999,6 +5002,7 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     uint32_t hflags = ctx->base.tb->flags;
 
     ctx->spr_cb = env->spr_cb;
+    ppc_fpscr_lazy = env_archcpu(env)->fpscr_lazy;
     ctx->pr = (hflags >> HFLAGS_PR) & 1;
     ctx->mem_idx = (hflags >> HFLAGS_DMMU_IDX) & 7;
     ctx->dr = (hflags >> HFLAGS_DR) & 1;
