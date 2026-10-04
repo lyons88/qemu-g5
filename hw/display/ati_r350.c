@@ -721,7 +721,9 @@ static DirtyBitmapSnapshot *ati_r350_take_dirty(ATIR350State *s)
                                                    ATI_R350_VRAM_SIZE,
                                                    DIRTY_MEMORY_VGA);
     /* the draw path claims dirty bits for textures; see gl_tex_lock */
-    QEMU_LOCK_GUARD(&s->gl_tex_lock);
+    qatomic_inc(&s->gl_tex_waiters);
+    qemu_rec_mutex_lock(&s->gl_tex_lock);
+    qatomic_dec(&s->gl_tex_waiters);
     for (i = 0; i < nblocks; i++) {
         if (!s->fb_block_pending[i] &&
             memory_region_snapshot_get_dirty(&s->vram, snap,
@@ -737,6 +739,7 @@ static DirtyBitmapSnapshot *ati_r350_take_dirty(ATIR350State *s)
      * it is discarded -- it is the sole record of what was set.
      */
     ati_r350_gl_epoch(s, snap);
+    qemu_rec_mutex_unlock(&s->gl_tex_lock);
     return snap;
 }
 
@@ -974,7 +977,9 @@ static bool ati_r350_update_display(void *opaque)
         redraw = true;
     }
     g_free(snap);
+    qatomic_inc(&s->gl_tex_waiters);
     qemu_rec_mutex_lock(&s->gl_tex_lock);
+    qatomic_dec(&s->gl_tex_waiters);
     s->mode = mode;             /* ati_r350_gl_admit() reads it */
     qemu_rec_mutex_unlock(&s->gl_tex_lock);
     s->mode_dirty = false;

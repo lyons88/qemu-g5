@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include <math.h>
+#include <sched.h>
 #include "hw/pci/pci_device.h"
 #include "system/physmem.h"
 #include "qemu/rcu.h"
@@ -8892,9 +8893,18 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
 static void r300_run_prims(ATIR350State *s, R300DrawState *d,
                            const R300Vtx *vb, unsigned nvtx, unsigned prim)
 {
+    int spin;
+
     qemu_rec_mutex_lock(&s->gl_tex_lock);
     r300_run_prims_locked(s, d, vb, nvtx, prim);
     qemu_rec_mutex_unlock(&s->gl_tex_lock);
+    /*
+     * Let a waiting display refresh in before the next draw takes the
+     * lock back (bounded, in case this thread still holds it further out).
+     */
+    for (spin = 0; spin < 2000 && qatomic_read(&s->gl_tex_waiters); spin++) {
+        sched_yield();
+    }
 }
 
 /*

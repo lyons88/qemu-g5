@@ -329,6 +329,13 @@ struct ATIR350State {
      * dirty bits it claims are shared by the draw path and the display.
      */
     QemuRecMutex gl_tex_lock;
+    /*
+     * The display refresh waiting for gl_tex_lock (atomic). The command
+     * processor takes the lock once per draw and would otherwise take it
+     * straight back, starving the refresh -- which holds the BQL, so every
+     * QEMU timer (the sound DMA among them) waits with it.
+     */
+    int gl_tex_waiters;
     /* R300 memory-controller indirect register file (MC_IND_INDEX/DATA) */
     uint32_t mc_ind[256];
     /*
