@@ -16,6 +16,10 @@
 #include "system/dma.h"
 #include "qemu/bswap.h"
 #include "trace.h"
+#include "qemu/main-loop.h"
+#include "qemu/aio.h"
+#include "system/iothread.h"
+#include "qapi/error.h"
 
 #define I2S_REG_INT_CTL             0x00
 #define I2S_REG_SERIAL_FORMAT       0x10
@@ -30,6 +34,8 @@
 #define K2_I2S_COUNT_LAG_NS         (20 * 1000 * 1000)
 /* FIFO depth a (re)started stream waits for, and how long it waits */
 #define K2_I2S_PREBUF_NS            (60 * 1000 * 1000)
+/* the most audio the host FIFO may hold before the excess is dropped */
+#define K2_I2S_FIFO_MAX_NS          (200 * 1000 * 1000)
 #define K2_I2S_PREBUF_GIVEUP_NS     (100 * 1000 * 1000)
 /* How far descriptor retirement may fall behind real time (default) */
 #define K2_I2S_MAX_DEBT_NS          (10 * 1000 * 1000)
@@ -124,7 +130,7 @@ static int k2_i2s_frame_bytes(K2SoundState *s)
 
 static uint32_t k2_i2s_frame_count(K2SoundState *s)
 {
-    uint64_t lag = (uint64_t)k2_i2s_rate(s) * K2_I2S_COUNT_LAG_NS /
+    uint64_t lag = (uint64_t)k2_i2s_rate(s) * s->count_lag_ns /
                    NANOSECONDS_PER_SECOND;
     uint64_t counted = s->walk_frames > lag ? s->walk_frames - lag : 0;
 
@@ -148,6 +154,7 @@ static uint64_t k2_i2s_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case I2S_REG_FRAME_COUNT:
         val = k2_i2s_frame_count(s);
+        s->st_fc_reads++;
         break;
     default:
         val = 0;
@@ -344,12 +351,44 @@ static void k2_i2s_tap_out(K2SoundState *s, DBDMA_io *io, int rate)
     }
 
     s->last_push_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /*
+     * The DMA runs in its own thread now, so a host side that stops
+     * pulling (main loop held up for seconds, e.g. by a Metal shader
+     * compile) no longer stops the walk: the FIFO filled to its 3 s
+     * capacity and stayed there, three seconds of lag for good. Past
+     * K2_I2S_FIFO_MAX_NS, drop the oldest audio back to the prebuffer.
+     */
+    {
+        uint32_t maxb = (uint64_t)rate * fb * K2_I2S_FIFO_MAX_NS /
+                        NANOSECONDS_PER_SECOND;
+        uint32_t keep = (uint64_t)rate * fb * K2_I2S_PREBUF_NS /
+                        NANOSECONDS_PER_SECOND;
+
+        maxb -= maxb % fb;
+        keep -= keep % fb;
+        if (s->fifo_count > maxb) {
+            uint32_t drop = s->fifo_count - keep;
+
+            s->fifo_rptr = (s->fifo_rptr + drop) % sizeof(s->out_fifo);
+            s->fifo_count -= drop;
+            s->st_drop += drop;
+        }
+    }
     while (remaining > 0) {
         int len = MIN(remaining, (int)sizeof(buf));
         int i;
 
         dma_memory_read(io->as, addr, buf, len,
                         MEMTXATTRS_UNSPECIFIED);
+        for (i = 0; i + fb <= len; i += fb) {
+            int j, nz = 0;
+
+            for (j = 0; j < fb; j++) {
+                nz |= buf[i + j];
+            }
+            s->st_frames++;
+            s->st_zero_frames += !nz;
+        }
         for (i = 0; i < len && s->fifo_count < sizeof(s->out_fifo); i++) {
             s->out_fifo[s->fifo_wptr] = buf[i];
             s->fifo_wptr = (s->fifo_wptr + 1) % sizeof(s->out_fifo);
@@ -379,6 +418,15 @@ static void k2_i2s_dir_complete(void *opaque)
         }
         io->dma_end(io);
     }
+}
+
+static IOThread *k2_iothread;
+
+static void k2_i2s_dir_timer(void *opaque)
+{
+    bql_lock();
+    k2_i2s_dir_complete(opaque);
+    bql_unlock();
 }
 
 /* Descriptors retire at the pace the audio would play */
@@ -415,13 +463,20 @@ static void k2_i2s_dma_rw(DBDMA_io *io)
         }
         d->deadline_ns = now - s->max_debt_ns;
     }
-    d->deadline_ns += (int64_t)frames * NANOSECONDS_PER_SECOND / rate;
-    if (d->deadline_ns <= now) {
-        io->dma_end(io);
-        return;
-    }
+    /*
+     * A descriptor shorter than a frame still takes a frame's time, so a
+     * ring of zero-length commands cannot spin with time standing still.
+     */
+    d->deadline_ns += (int64_t)MAX(frames, 1) * NANOSECONDS_PER_SECOND / rate;
+    /*
+     * Always retire from the timer, never by calling dma_end() here:
+     * dma_end() runs the channel, which calls straight back into this
+     * function, so catching up after a stall used to recurse once per
+     * descriptor -- hundreds deep, and without end on a zero-length ring
+     * (main loop stuck in k2_i2s_dma_rw holding the BQL: the lock-up).
+     */
     d->pending = io;
-    timer_mod(d->timer, d->deadline_ns);
+    timer_mod(d->timer, MAX(d->deadline_ns, now));
 }
 
 /* The outstanding command completes before the channel reports stopped */
@@ -481,9 +536,21 @@ void k2_sound_init(K2SoundState *s, DeviceState *owner, MemoryRegion *bar)
                           "k2-i2s-a", K2_I2S_SIZE);
     memory_region_add_subregion(bar, K2_I2S_BASE, &s->i2s_mem);
 
+    /*
+     * The DMA pacing timers run in their own thread, not the main loop:
+     * the main loop also runs the display refresh, which waits whole
+     * frames for the Radeon's software rasterizer (QuickTime's YUV
+     * program), and the sound DMA stalled behind it -- 18-36 ms per video
+     * frame, played back by the guest as gaps. The callback takes the BQL
+     * itself, as everything on the DBDMA side expects.
+     */
+    if (!k2_iothread) {
+        k2_iothread = iothread_create("k2-sound", &error_abort);
+    }
     for (i = 0; i < 2; i++) {
-        s->dir[i].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                       k2_i2s_dir_complete, &s->dir[i]);
+        s->dir[i].timer = aio_timer_new(iothread_get_aio_context(k2_iothread),
+                                        QEMU_CLOCK_VIRTUAL, SCALE_NS,
+                                        k2_i2s_dir_timer, &s->dir[i]);
     }
     k2_sound_reset(s);
 }
@@ -511,7 +578,8 @@ static void k2_sound_log_tick(void *opaque)
     fprintf(s->log, "t=%.1f desc=%" PRIu64 " late_avg=%" PRId64 "us "
             "late_max=%" PRId64 "us debt=%.1fms cb=%" PRIu64 " short=%" PRIu64
             " empty=%" PRIu64 " refill=%" PRIu64 " silence=%" PRIu64
-            " drop=%" PRIu64 " fifo=%.1f..%.1fms\n",
+            " drop=%" PRIu64 " fifo=%.1f..%.1fms fcread=%" PRIu64
+            " zero=%.0f%%\n",
             (now - s->log_t0) / 1e9, s->st_desc,
             s->st_desc ? s->st_late_sum / (int64_t)s->st_desc / 1000 : 0,
             s->st_late_max / 1000, s->st_debt_ns / 1e6, s->st_cb,
@@ -519,8 +587,10 @@ static void k2_sound_log_tick(void *opaque)
             s->st_drop,
             bpms ? (s->st_fifo_min == UINT32_MAX ? 0 : s->st_fifo_min) / bpms
                  : 0.0,
-            bpms ? s->st_fifo_max / bpms : 0.0);
+            bpms ? s->st_fifo_max / bpms : 0.0, s->st_fc_reads,
+            s->st_frames ? 100.0 * s->st_zero_frames / s->st_frames : 0.0);
     fflush(s->log);
+    s->st_fc_reads = s->st_frames = s->st_zero_frames = 0;
     s->st_desc = s->st_cb = s->st_cb_short = s->st_cb_empty = 0;
     s->st_silence = s->st_drop = s->st_prebuf = s->st_debt_ns = 0;
     s->st_late_max = s->st_late_sum = 0;

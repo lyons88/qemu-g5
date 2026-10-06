@@ -263,7 +263,8 @@ bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap, bool multi,
                         fetched = true;
                     }
                 }
-                if (!fetched || n >= 4) {
+                /* a fetched set 4-7 is divided in the frame, not raw */
+                if (!fetched) {
                     rawmask |= 1u << n;
                 }
             }
@@ -461,7 +462,10 @@ bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap, bool multi,
 
         switch (a->a_op) {
         case R300_US_A_DP:
-            us_emit(&b, "        ares = DOT;\n");
+            /* the RGB side's dot product: DP4's when it runs DP4 */
+            us_emit(&b, a->rgb_op == R300_US_RGB_DP4 ?
+                        "        ares = fma(aA, aB, DOT);\n" :
+                        "        ares = DOT;\n");
             break;
         case R300_US_A_MIN:
             us_emit(&b, "        ares = aA < aB ? aA : aB;\n");

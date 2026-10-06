@@ -37,11 +37,35 @@ Turn any of them off individually:
 ### Audio (K2 I2S sound)
 
 - **iTunes skipping while windows move: about 90% fixed; still being tracked.** The cause was the Radeon's draw thread taking the texture lock back after every draw. That starved the display refresh, which holds QEMU's big lock while it waits, and the sound DMA timers stalled behind it for 40 ms to over 1 s. The draw thread now steps aside between draws whenever the refresh is waiting. In testing, 93 s of playback with window dragging had no buffer underruns, and the worst timer delay was 52 ms.
-- **Low-watermark rebuffering** (`audio-low-ms`, default 20). If the host buffer drops below this, it refills before playing on, instead of popping on every callback from then on. Turn it off with `-global macio-newworld.audio-low-ms=0`.
-- **Catch-up limit** (`audio-catchup-ms`, default 10). Caps how far behind the sound DMA is allowed to fall before it resyncs. Keep it small; large values burst-retire buffers and can freeze the guest.
+- **Low-watermark rebuffering** (`audio-low-ms`, default 0 = off). If set, the host buffer refills before playing on whenever it drops below this many milliseconds. The 200 ms FIFO cap now covers what this used to do.
+- **Catch-up limit** (`audio-catchup-ms`, default 250). Caps how far behind the sound DMA is allowed to fall before it resyncs. Large values used to freeze the guest; that was a recursion bug, now fixed (see below).
 - **Opt-in audio log** (`-global macio-newworld.audio-log=FILE`). Writes one line a second with DMA lateness, FIFO depth, underruns and refills. It does nothing unless set.
 - **Quake 3 "racing / laser" sound: fixed.**
 - Includes Cat_7's macOS nanosecond kqueue poll timeout (`util/qemu-timer.c`).
+
+### QuickTime video and sound
+
+- **Colours fixed.** QuickTime's YUV-to-RGB fragment program now renders correctly. Volume (3D) textures are supported, which ColorSync's 32x32x32 lookup table needs. The alpha `DP` op now returns the full DP4 result when the RGB side runs DP4. The packed 4:2:2 formats (`0x14`/`0x15`) are decoded too. `yuv-cat-order=on` on the device switches to the byte order of Cat's `g5-yuvtex`.
+- **On Metal.** QuickTime's program fetches through texture coordinate sets 4 and up, which the Metal general path used to refuse, so every video frame ran in the software interpreter at about 34 ms a frame. Sets 4-7 now reach the shader divided by q, as the interpreter does. Draws that would need a LOD from one of those sets still fall back. The translated-shader buffer grew from 16 KB to 128 KB, because this program overflowed it.
+- **Faster frame upload.** A 32-bit texture row in VRAM under one swap is now read with the swap resolved once per row, not once per texel. For a 720x480 frame that is about 345,000 fewer swap lookups per frame. This matters most when the host CPU is throttled, for example in Low Power Mode.
+- **Sound in step.** The K2 sound DMA timers run in their own thread (`k2-sound`), so a slow display refresh no longer holds them up. While waiting for the draw thread, the display refresh now releases QEMU's big lock, so the guest's CPUs keep running. The host FIFO is capped at 200 ms, so a host stall costs one skip instead of seconds of lag. Catching up after a stall no longer recurses once per descriptor; that recursion overflowed the stack and locked QEMU up.
+- New on `macio-newworld`: `audio-count-lag-ms` (default 20), how far the I2S frame counter trails the DMA. The opt-in audio log also reports `fcread` (frame-counter reads per second) and `zero` (how much of the guest's audio was silent when the DMA read it).
+- Known issue: the first time QuickTime opens after a fresh build, Metal compiles its shader. The display freezes for a few seconds and the mouse can leave the window. Later runs use the cached shader.
+- **Audio defaults.** The values QuickTime was tested with are now the defaults, so this is all a G5 needs:
+
+  ```
+  -audiodev coreaudio,id=snd -global macio-newworld.audiodev=snd
+  ```
+
+  To adjust one, add it to the command line with a different value:
+
+  | Setting | Default | What it does |
+  |---|---|---|
+  | `-audiodev coreaudio,...,out.buffer-count=N` | 8 (QEMU's own default is 4) | CoreAudio output buffers; more rides out longer host stalls, at the cost of latency |
+  | `-global macio-newworld.audio-catchup-ms=N` | 250 | How far behind the sound DMA may fall before audio is dropped to resync |
+  | `-global macio-newworld.audio-low-ms=N` | 0 (off) | Refill the host buffer before playing on when it falls below N ms |
+  | `-global macio-newworld.audio-count-lag-ms=N` | 20 | How far the I2S frame counter trails the DMA (debugging) |
+  | `-global macio-newworld.audio-log=FILE` | off | One line a second of sound timing statistics (debugging) |
 
 ### Cat_7's newer changes were rolled back
 
@@ -103,6 +127,7 @@ Tested at **640×480 with every option at its lowest** and **Hardware Shaders: N
 - `gl-async=on` can leave Tiger stuck at the desktop waiting on a held-back fence.
 - The ATI Ocean demo's water is too dark.
 - Audio can still pop occasionally under heavy screen activity (about 90% fixed; being tracked).
+- Sound stutters and pops when the host M2 is in Low Power Mode. Turn Low Power Mode off for smooth audio.
 - Based on powermac73 from late September 2026; Cat's newer changes were rolled back (see above).
 
 ## Credits

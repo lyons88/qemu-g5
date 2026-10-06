@@ -96,7 +96,11 @@ typedef struct R300TexUnit {
     unsigned code;          /* TX_FORMAT1 TXFORMAT, to tell the widths apart */
     unsigned dxt;           /* 1, 3 or 5: S3TC compressed (DXTn), else 0 */
     unsigned yuv;           /* 0x14/0x15: packed 4:2:2, else 0 */
-    bool yuv_rgb;           /* TX_FORMAT1 bit 22: convert YCbCr to RGB */
+    /*
+     * 4:2:2 only: TX_FORMAT1 YUV_TO_RGB in bits 0-1 (0 off, 1 with
+     * clamp, 2 without) and SWAP_YUV in bit 2
+     */
+    unsigned yuv_mode;
     unsigned sel[4];        /* TX_FORMAT1 component select, A R G B */
     unsigned clamp_s, clamp_t;  /* TX_FILTER0 clamp modes (0 = repeat) */
     unsigned lanes;         /* TX_OFFSET ENDIAN_SWAP as a byte-lane xor */
@@ -126,6 +130,15 @@ typedef struct R300TexUnit {
      */
     bool cube;
     uint32_t fsz[R300_TEX_LEVELS];
+    /*
+     * TX_FORMAT1 TEX_COORD_TYPE 1: a volume (3D) texture, `depth` slices
+     * of w x h (TX_FORMAT0 bits 22-25, log2) back to back, `fsz[0]`
+     * bytes apart -- e.g. the 32x32x32 ColorSync table QuickTime looks
+     * its video frames up in. Level 0 only; a fetch addresses a slice
+     * through r300_cube_face, as a cube map does a face.
+     */
+    bool vol;
+    unsigned depth;
 } R300TexUnit;
 
 /* the cube face the calling thread's current fetch addresses */
@@ -970,25 +983,38 @@ static uint32_t r300_yuv_texel(ATIR350State *s, const R300DrawState *d,
     uint8_t b3 = r300_tex_byte(s, d, unit, a + 3);
     int y, cb, cr, r, g, b;
 
-    if (u->yuv == 0x14) {
-        cb = b0; cr = b2; y = (i & 1) ? b3 : b1;
+    /*
+     * The two formats' byte orders are each other's: which one is 0x14
+     * is what yuv-cat-order picks (see ati_r350_int.h).
+     */
+    if ((u->yuv == 0x14) != s->yuv_cat_order) {
+        cb = b0; cr = b2; y = (i & 1) ? b3 : b1;     /* Cb Y0 Cr Y1 */
     } else {
-        cb = b1; cr = b3; y = (i & 1) ? b2 : b0;
+        cb = b1; cr = b3; y = (i & 1) ? b2 : b0;     /* Y0 Cb Y1 Cr */
     }
-    if (u->yuv_rgb) {
-        float yf = 1.164f * (y - 16);
+    /* SWAP_YUV inverts the top bit of U and V (Cat's g5-yuvtex) */
+    if (u->yuv_mode & 4) {
+        cb ^= 0x80;
+        cr ^= 0x80;
+    }
+    /*
+     * The component select does not apply to the YUV formats; the unit's
+     * select is fixed at (W,Z,Y,X), so the texel is (X,Y,Z,W) =
+     * (U,Y,V,A) with YUV_TO_RGB off and (B,G,R,A) with it on. BT.601,
+     * Y in 16-235, chroma in 16-240; eight-bit components, so the
+     * unclamped mode clamps too.
+     */
+    if (!(u->yuv_mode & 3)) {
+        return r300_pack_xyzw(cb, y, cr, 0xff);
+    }
+    {
+        int c = 298 * (y - 16) + 128, dd = cb - 128, e = cr - 128;
 
-        r = (int)lrintf(yf + 1.596f * (cr - 128));
-        g = (int)lrintf(yf - 0.813f * (cr - 128) - 0.391f * (cb - 128));
-        b = (int)lrintf(yf + 2.018f * (cb - 128));
-        r = MIN(MAX(r, 0), 255);
-        g = MIN(MAX(g, 0), 255);
-        b = MIN(MAX(b, 0), 255);
-    } else {
-        r = cr; g = y; b = cb;
+        b = MIN(MAX((c + 516 * dd) >> 8, 0), 255);
+        g = MIN(MAX((c - 100 * dd - 208 * e) >> 8, 0), 255);
+        r = MIN(MAX((c + 409 * e) >> 8, 0), 255);
     }
-    return 255u | ((uint32_t)b << 8) | ((uint32_t)g << 16) |
-           ((uint32_t)r << 24);
+    return r300_pack_xyzw(b, g, r, 0xff);
 }
 
 static inline uint32_t r300_tex_lvl_texel(ATIR350State *s,
@@ -1008,7 +1034,8 @@ static inline uint32_t r300_tex_lvl_texel(ATIR350State *s,
         return r300_yuv_texel(s, d, unit, l, i, j);
     }
     return r300_tex_at(s, d, unit, u->loff[l] +
-                                   (u->cube ? r300_cube_face * u->fsz[l] : 0) +
+                                   (u->cube || u->vol ?
+                                    r300_cube_face * u->fsz[l] : 0) +
                                    (uint32_t)j * u->lpitch[l] +
                                    (uint32_t)i * (u->bpp / 8));
 }
@@ -1888,6 +1915,43 @@ static void r300_us_sample(void *ctx, unsigned unit, bool proj,
         t = r300_tex_filter(c->s, d, unit,
                             (sc / ma + 1.0f) * 0.5f * (float)u->w,
                             (tc / ma + 1.0f) * 0.5f * (float)u->h, der);
+        r300_cube_face = 0;
+    } else if (u->vol) {
+        /*
+         * A volume: bilinear within the two slices either side of r,
+         * blended between them (point: the nearer slice). r clamps.
+         */
+        float der[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float rz = coord[2] * (float)u->depth - 0.5f;
+        int z0 = (int)floorf(rz), z1 = z0 + 1;
+        int fz = (int)lrintf((rz - floorf(rz)) * 256.0f);
+        float fs = coord[0] * (float)u->w, ft = coord[1] * (float)u->h;
+
+        if (u->need_lod) {
+            const float *g = r300_us_der(c, unit, src);
+
+            der[0] = g[0] * (float)u->w;
+            der[1] = g[1] * (float)u->h;
+            der[2] = g[2] * (float)u->w;
+            der[3] = g[3] * (float)u->h;
+        }
+        z0 = MIN(MAX(z0, 0), (int)u->depth - 1);
+        z1 = MIN(MAX(z1, 0), (int)u->depth - 1);
+        if (u->mag == R300_TX_FILTER_POINT) {
+            if (fz >= 128) {
+                z0 = z1;
+            }
+            fz = 0;
+        }
+        r300_cube_face = z0;
+        t = r300_tex_filter(c->s, d, unit, fs, ft, der);
+        if (fz && z1 != z0) {
+            uint32_t t1;
+
+            r300_cube_face = z1;
+            t1 = r300_tex_filter(c->s, d, unit, fs, ft, der);
+            t = r300_lerp4(t, t1, fz);
+        }
         r300_cube_face = 0;
     } else if (u->filt) {
         float der[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -4051,7 +4115,8 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
              * frame raw, not as the (s/q, t/q, 0, 1) of a 2D fetch.
              */
             if (p->rs.tex_reg[k] == t->src &&
-                !(t->unit < R300_TEX_UNITS && d->tex[t->unit].cube)) {
+                !(t->unit < R300_TEX_UNITS &&
+                  (d->tex[t->unit].cube || d->tex[t->unit].vol))) {
                 d->tc_raw &= ~(1u << k);
             }
         }
@@ -4251,7 +4316,7 @@ static void r300_tex_filter_setup(ATIR350State *s, R300TexUnit *u,
         u->loff[l] = a;
         u->lpitch[l] = l ? ROUND_UP(w, aw) * bytes : u->pitch;
         u->fsz[l] = ROUND_UP(w, aw) * bytes * ROUND_UP(h, ah);
-        a += u->fsz[l] * (u->cube ? 6 : 1);
+        a += u->fsz[l] * (u->cube ? 6 : u->vol ? u->depth : 1);
     }
     /* one level is addressed, and cached, exactly as before */
     if (u->dxt) {
@@ -4270,15 +4335,19 @@ static void r300_tex_filter_setup(ATIR350State *s, R300TexUnit *u,
         /* the byte span per texel row, for the range checks elsewhere */
         u->pitch = u->lpitch[0] / 4;
     }
-    u->nlev = u->filt ? u->last + 1 : 1;
+    u->nlev = u->filt && !u->vol ? u->last + 1 : 1;
     u->chain = u->nlev > 1 || u->cube ? a - u->off
-                                      : (uint32_t)u->h * u->pitch;
+             : u->vol ? u->fsz[0] * u->depth
+                      : (uint32_t)u->h * u->pitch;
     u->ltexels = 0;
     for (l = 0; l < u->nlev; l++) {
         u->ltexels += (size_t)u->lw[l] * u->lh[l];
     }
     if (u->cube) {
         u->ltexels *= 6;    /* the backend's copy: faces stacked per level */
+    }
+    if (u->vol) {
+        u->ltexels *= u->depth;     /* slices stacked */
     }
 }
 
@@ -4318,13 +4387,13 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
     u->code = txcode;
     u->dxt = 0;
     u->yuv = 0;
-    u->yuv_rgb = false;
+    u->yuv_mode = 0;
     switch (txcode) {
     case 0x14:          /* B8G8_B8G8 */
     case 0x15:          /* G8R8_G8B8 */
         u->bpp = 16;
         u->yuv = txcode;
-        u->yuv_rgb = (txfmt1 >> 22) & 1;
+        u->yuv_mode = ((txfmt1 >> 22) & 3) | ((txfmt1 >> 24) & 1 ? 4 : 0);
         break;
     case R300_TX_FMT_8:
         u->bpp = 8;
@@ -4365,6 +4434,11 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
      * the other way round.
      */
     for (ch = 0; ch < 4; ch++) {
+        if (u->yuv) {
+            /* fixed (W,Z,Y,X) for 4:2:2; see r300_yuv_texel() */
+            u->sel[ch] = R300_TX_SEL_W - ch;
+            continue;
+        }
         u->sel[ch] = (txfmt1 >> (R300_TX_FORMAT1_SEL_SHIFT + ch * 3)) &
                      R300_TX_FORMAT1_SEL_MASK;
         if (u->en && u->sel[ch] > R300_TX_SEL_ONE) {
@@ -4374,6 +4448,11 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
     u->clamp_s = filt0 & 7;
     u->clamp_t = (filt0 >> 3) & 7;
     u->cube = ((txfmt1 >> 25) & 3) == 2 && !u->dxt && !u->yuv;
+    u->depth = 1u << ((txfmt0 >> 22) & 0xf);
+    u->vol = ((txfmt1 >> 25) & 3) == 1 && !u->dxt && !u->yuv && u->depth > 1;
+    if (!u->vol) {
+        u->depth = 1;
+    }
     if (u->cube) {
         /* a face's edge is the next face's; never wrap within one */
         u->clamp_s = u->clamp_t = 2;
@@ -4388,7 +4467,7 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
         u->pitch = (uint32_t)u->w * (u->bpp / 8);
     }
     r300_tex_filter_setup(s, u, unit, txfmt0, filt0);
-    if (u->cube) {
+    if (u->cube || u->vol) {
         u->filt = true;     /* r300_sample_tex() knows no faces */
     }
 }
@@ -7705,7 +7784,8 @@ static bool r300_gl_decode_tex32(ATIR350State *s, const R300DrawState *d,
     for (ty = 0; ty < u->h; ty++) {
         uint32_t a = u->off + (uint32_t)ty * u->pitch;
         uint32_t end = a + (uint32_t)(u->w - 1) * 4;
-        uint32_t off;
+        uint32_t off, eoff;
+        unsigned xr;
         uint8_t *p = rgba + (size_t)ty * u->w * 4;
 
         if (!ati_r350_mc_to_vram(s, a, &off) &&
@@ -7713,6 +7793,20 @@ static bool r300_gl_decode_tex32(ATIR350State *s, const R300DrawState *d,
             ati_r350_mc_read_block(s, a, row, u->w);
             for (tx = 0; u->lanes && tx < u->w; tx++) {
                 row[tx] = r300_lane_xor32(row[tx], u->lanes);
+            }
+        } else if (ati_r350_mc_to_vram(s, a, &off) &&
+                   ati_r350_mc_to_vram(s, end, &eoff) &&
+                   eoff - off == end - a &&
+                   (uint64_t)eoff + 4 <= ATI_R350_VRAM_SIZE &&
+                   ati_r350_vram_xor_span(s, off, eoff + 4 - off, &xr)) {
+            /*
+             * The whole row in VRAM under one swap: resolved once, not
+             * per texel. Per texel, the swapper walk was most of the
+             * cost of decoding QuickTime's 720x480 frame -- ~39 ms a
+             * frame, every frame, which starved its audio.
+             */
+            for (tx = 0; tx < u->w; tx++) {
+                row[tx] = r300_ld32x(d, off + (uint32_t)tx * 4, xr);
             }
         } else {
             for (tx = 0; tx < u->w; tx++) {
@@ -7766,6 +7860,28 @@ static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
                         p[2] = r300_texel_byte(u, texel, 3);
                         p[3] = r300_texel_byte(u, texel, 0);
                     }
+                }
+            }
+        }
+        r300_cube_face = 0;
+        return;
+    }
+
+    /* a volume: level 0's slices one after another, `depth` images tall */
+    if (u->vol) {
+        unsigned z;
+
+        p = rgba;
+        for (z = 0; z < u->depth; z++) {
+            r300_cube_face = z;
+            for (ty = 0; ty < u->h; ty++) {
+                for (tx = 0; tx < u->w; tx++, p += 4) {
+                    uint32_t texel = r300_tex_lvl_texel(s, d, unit, 0, tx, ty);
+
+                    p[0] = r300_texel_byte(u, texel, 1);
+                    p[1] = r300_texel_byte(u, texel, 2);
+                    p[2] = r300_texel_byte(u, texel, 3);
+                    p[3] = r300_texel_byte(u, texel, 0);
                 }
             }
         }
@@ -7858,7 +7974,8 @@ static void r300_gl_filt(const R300TexUnit *u, R350GlReq *r, unsigned i)
     f[8] = u->bias;
     f[9] = u->wl2;
     f[10] = u->hl2;
-    f[11] = u->cube;
+    /* 1: a cube map; -depth: a volume, its slices stacked */
+    f[11] = u->cube ? 1 : u->vol ? -(int)u->depth : 0;
     r->levels[i] = u->nlev;
     r->border[i][0] = r300_texel_byte(u, u->border, 1);
     r->border[i][1] = r300_texel_byte(u, u->border, 2);
@@ -7876,6 +7993,7 @@ static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
            s->gl_tex[k].pitch == u->pitch &&
            s->gl_tex[k].bpp == u->bpp &&
            s->gl_tex[k].code == u->code &&
+           s->gl_tex[k].yuv_mode == u->yuv_mode &&
            s->gl_tex[k].w == u->w && s->gl_tex[k].h == u->h &&
            s->gl_tex[k].xr == xr &&
            s->gl_tex[k].sel[0] == u->sel[0] &&
@@ -7958,7 +8076,7 @@ static const uint8_t *r300_gl_btex(ATIR350State *s, const R300DrawState *d,
     key = r300_mix64(key, ((uint64_t)u->w << 32) | (uint32_t)u->h);
     key = r300_mix64(key, ((uint64_t)u->pitch << 32) | u->chain);
     key = r300_mix64(key, ((uint64_t)u->bpp << 40) | ((uint64_t)u->code << 32) |
-                          ((uint64_t)u->yuv_rgb << 24) | (u->lanes << 16) |
+                          ((uint64_t)u->yuv_mode << 24) | (u->lanes << 16) |
                           u->nlev);
     key = r300_mix64(key, ((uint64_t)u->sel[0] << 48) |
                           ((uint64_t)u->sel[1] << 32) |
@@ -8101,6 +8219,7 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
     s->gl_tex[victim].pitch = u->pitch;
     s->gl_tex[victim].bpp = u->bpp;
     s->gl_tex[victim].code = u->code;
+    s->gl_tex[victim].yuv_mode = u->yuv_mode;
     s->gl_tex[victim].w = u->w;
     s->gl_tex[victim].h = u->h;
     s->gl_tex[victim].xr = xr;
@@ -8336,7 +8455,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     bool cube_gen = false;
 
     for (i = 0; shade && i < R300_TEX_UNITS; i++) {
-        if (d->tex[i].en && d->tex[i].cube) {
+        if (d->tex[i].en && (d->tex[i].cube || d->tex[i].vol)) {
             if (!(s->gl_api && !strcmp(s->gl_api, "metal") && d->fs &&
                   d->fs->gl_general && s->us_glsl_ok &&
                   (!d->fs->gl_multi || s->us_glsl_gen_ok))) {
@@ -8347,6 +8466,15 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
             cube_gen = d->fs->gl_multi;
             break;
         }
+    }
+    /*
+     * A fetch from set 4-7 reaches the Metal frame without a footprint
+     * (XI.der covers sets 0-3): fine for a texture sampled at one LOD,
+     * the software path for one that needs a LOD chosen.
+     */
+    if (shade && d->fs && d->fs->gl_gset_hi && d->lod_any) {
+        s->us_grefuse[2]++;
+        return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
     }
     if (shade && (!d->fs_run || !s->us_glsl_ok)) {
         const R300UsProgram *p = d->fs;
@@ -8651,7 +8779,8 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         req.tex_slot[i] = texslot[i];
         req.tex_fresh[i] = texfresh[i];
         req.tex_w[i] = d->tex[i].w;
-        req.tex_h[i] = d->tex[i].h * (d->tex[i].cube ? 6 : 1);
+        req.tex_h[i] = d->tex[i].h * (d->tex[i].cube ? 6 :
+                                      d->tex[i].vol ? (int)d->tex[i].depth : 1);
         req.clamp_s[i] = d->tex[i].clamp_s;
         req.clamp_t[i] = d->tex[i].clamp_t;
         r300_gl_filt(&d->tex[i], &req, i);

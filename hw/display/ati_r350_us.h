@@ -385,6 +385,7 @@ typedef struct R300UsProgram {
      * coordinate set above 3).
      */
     unsigned gl_gunit[4], gl_ngen, gl_gwhy;
+    bool gl_gset_hi;            /* a fetch addresses a set 4-7 directly */
     uint8_t gl_gslot[R300_TEX_UNITS];
     /*
      * The one texture fetch, resolved: which frame register receives the

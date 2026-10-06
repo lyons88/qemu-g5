@@ -700,6 +700,32 @@ static void ati_r350_scan_vram_activity(ATIR350State *s)
 }
 
 /*
+ * Take gl_tex_lock for the display refresh. The command processor holds
+ * it for a whole draw -- 20-40 ms when a fragment program runs in the
+ * software interpreter (QuickTime's YUV conversion) -- and the refresh
+ * holds the BQL, so blocking here froze every vCPU and every QEMU timer
+ * with it: the guest's sound thread missed its deadlines and the sound
+ * DMA played the gaps (choppy QuickTime audio). Wait for the draw with
+ * the BQL released instead; gl_tex_waiters stays raised throughout, so
+ * the command processor yields after the draw and the final lock, taken
+ * with the BQL (the usual order: BQL, then gl_tex_lock), finds it free.
+ */
+static void ati_r350_display_tex_lock(ATIR350State *s)
+{
+    qatomic_inc(&s->gl_tex_waiters);
+    if (qemu_rec_mutex_trylock(&s->gl_tex_lock) != 0) {
+        if (bql_locked()) {
+            bql_unlock();
+            qemu_rec_mutex_lock(&s->gl_tex_lock);
+            qemu_rec_mutex_unlock(&s->gl_tex_lock);
+            bql_lock();
+        }
+        qemu_rec_mutex_lock(&s->gl_tex_lock);
+    }
+    qatomic_dec(&s->gl_tex_waiters);
+}
+
+/*
  * Consume the VRAM dirty bitmap once per refresh: note which scan blocks
  * were written (for the activity heuristic above) and return the snapshot
  * so the caller can ask whether the range it is about to display changed.
@@ -721,9 +747,7 @@ static DirtyBitmapSnapshot *ati_r350_take_dirty(ATIR350State *s)
                                                    ATI_R350_VRAM_SIZE,
                                                    DIRTY_MEMORY_VGA);
     /* the draw path claims dirty bits for textures; see gl_tex_lock */
-    qatomic_inc(&s->gl_tex_waiters);
-    qemu_rec_mutex_lock(&s->gl_tex_lock);
-    qatomic_dec(&s->gl_tex_waiters);
+    ati_r350_display_tex_lock(s);
     for (i = 0; i < nblocks; i++) {
         if (!s->fb_block_pending[i] &&
             memory_region_snapshot_get_dirty(&s->vram, snap,
@@ -977,9 +1001,7 @@ static bool ati_r350_update_display(void *opaque)
         redraw = true;
     }
     g_free(snap);
-    qatomic_inc(&s->gl_tex_waiters);
-    qemu_rec_mutex_lock(&s->gl_tex_lock);
-    qatomic_dec(&s->gl_tex_waiters);
+    ati_r350_display_tex_lock(s);
     s->mode = mode;             /* ati_r350_gl_admit() reads it */
     qemu_rec_mutex_unlock(&s->gl_tex_lock);
     s->mode_dirty = false;
@@ -5017,6 +5039,7 @@ static const Property ati_r350_properties[] = {
      * of stopping the command processor for it (see ati_r350_defer()).
      */
     DEFINE_PROP_BOOL("gl-async", ATIR350State, gl_async, false),
+    DEFINE_PROP_BOOL("yuv-cat-order", ATIR350State, yuv_cat_order, false),
     /*
      * Diagnostic only (milestone M4): translate each vertex program the
      * guest uploads to GLSL and count whether the translator could

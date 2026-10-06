@@ -780,7 +780,8 @@ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as)
     core->frame_size_setting = audio_buffer_frames(
         qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
 
-    core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+    /* 8, not 4: rides out host stalls (G5 K2 sound, QuickTime) */
+    core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 8;
 
     status = AudioObjectAddPropertyListener(kAudioObjectSystemObject,
                                             &voice_out_addr,

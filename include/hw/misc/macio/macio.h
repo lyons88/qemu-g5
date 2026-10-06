@@ -167,6 +167,7 @@ struct NewWorldMacIOState {
     bool k2;
     uint32_t audio_catchup_ms;  /* K2 sound: how far DMA may catch up */
     uint32_t audio_low_ms;      /* K2 sound: rebuffer below this */
+    uint32_t audio_count_lag_ms; /* K2 sound: frame count lag */
     char *audio_log;            /* audio-log=FILE: K2 sound timing, 1 line/s */
     OpenPICState pic;
     MACIOIDEState ide[2];

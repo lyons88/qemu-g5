@@ -66,6 +66,7 @@ typedef struct K2SoundState {
     int64_t max_debt_ns;        /* audio-catchup-ms on macio-newworld */
     uint32_t low_ms;            /* audio-low-ms: rebuffer below this */
     uint32_t low_bytes;
+    int64_t count_lag_ns;       /* audio-count-lag-ms: frame count trails walk */
 
     /* audio-log: per-second timing statistics (see k2_sound_start_log) */
     FILE *log;
@@ -73,6 +74,7 @@ typedef struct K2SoundState {
     int64_t log_t0;
     uint64_t st_desc, st_cb, st_cb_short, st_cb_empty, st_silence;
     uint64_t st_drop, st_prebuf, st_debt_ns;
+    uint64_t st_fc_reads, st_frames, st_zero_frames;
     int64_t st_late_max, st_late_sum;
     uint32_t st_fifo_min, st_fifo_max;
 } K2SoundState;

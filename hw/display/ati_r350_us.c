@@ -650,18 +650,21 @@ void r300_us_analyse(R300UsProgram *p,
         memset(p->gl_gslot, 0, sizeof(p->gl_gslot));
         memset(p->gl_gunit, 0, sizeof(p->gl_gunit));
         /*
-         * Sets 4-7 reach the backend raw only (no footprint, no
-         * per-set size): fine for a set the program does arithmetic on,
-         * refused for one a fetch addresses directly.
+         * Sets 4-7 reach the backend as the raw vertex output; the Metal
+         * frame divides a FETCHED one by q per vertex and interpolates
+         * it, as r300_vs_texcoord() and r300_raster_tri() do (QuickTime's
+         * YUV-to-RGB program fetches with set 4 and up). What it does
+         * not carry is their footprint, so a draw that would need a LOD
+         * from one is refused per draw (gl_gset_hi, r300_gl_draw).
          */
+        p->gl_gset_hi = false;
         for (k = R300_GL_FETCH_SETS; k < R300_TEXCOORDS; k++) {
             if (p->rs.tex_reg[k] >= 0) {
                 for (j = 0; j < p->ntex && j < R300_US_TEX_SLOTS; j++) {
                     if ((p->tex[j].op == R300_US_TEXOP_LD ||
                          p->tex[j].op == R300_US_TEXOP_PROJ) &&
                         p->tex[j].src == (unsigned)p->rs.tex_reg[k]) {
-                        ok = false;
-                        p->gl_gwhy = 2;
+                        p->gl_gset_hi = true;
                     }
                 }
             }
@@ -1068,7 +1071,15 @@ static void us_run_alu(const R300UsProgram *p, R300UsRegs *g,
 
     switch (a->a_op) {
     case R300_US_A_DP:
-        ares = dot;
+        /*
+         * OP_DP takes the RGB side's dot product as it is: the DP4 one
+         * when that side runs DP4, fourth term included. QuickTime's
+         * YUV->RGB program puts its BT.601 offset in that fourth term
+         * (c4..c6.w, -0.87/+0.53/-1.09) and moves the alpha result into
+         * the colour; without it every channel came out ~1.0 too high --
+         * blue and red pinned, green near zero: magenta video.
+         */
+        ares = a->rgb_op == R300_US_RGB_DP4 ? dot + aA * aB : dot;
         break;
     case R300_US_A_MIN:
         ares = aA < aB ? aA : aB;

@@ -777,6 +777,14 @@ struct ATIR350State {
      * the command processor thread once the GPU reports the work done.
      */
     bool gl_async;
+    /*
+     * yuv-cat-order=on: read the packed 4:2:2 texture formats in the byte
+     * order of Cat's g5-yuvtex (0x14 Y0 Cb Y1 Cr, 0x15 Cb Y0 Cr Y1, after
+     * the R5xx guide's C_VYUY / C_YVYU). Off: this tree's order (0x14
+     * Cb Y0 Cr Y1 '2vuy', 0x15 Y0 Cb Y1 Cr 'yuvs'). For comparing the two
+     * on QuickTime video without a rebuild.
+     */
+    bool yuv_cat_order;
     struct {
         uint64_t serial;
         uint32_t val;
@@ -836,6 +844,7 @@ struct ATIR350State {
     struct {
         uint32_t off, len, pitch;
         unsigned bpp, code, xr;
+        unsigned yuv_mode;          /* 4:2:2: YUV_TO_RGB and SWAP_YUV */
         unsigned sel[4];
         int w, h;
         unsigned nlev;              /* mip levels decoded, one after another */
@@ -1024,9 +1033,10 @@ struct ATIR350State {
      * The constants are flattened per draw because they change without
      * the program changing.
      */
-    char us_glsl[16 * 1024];
+    /* 128 KiB: QuickTime's 34-instruction YUV program overflowed 16 */
+    char us_glsl[128 * 1024];
     /* the same program as a general one, for draws sampling a cube map */
-    char us_glsl_gen[16 * 1024];
+    char us_glsl_gen[128 * 1024];
     uint64_t us_glsl_gen_key;
     bool us_glsl_gen_ok;
     bool us_glsl_ok;
