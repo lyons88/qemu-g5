@@ -1,6 +1,6 @@
 # QEMU Power Mac G5 — Radeon 9800 Metal back end
 
-This is a fork of [Cat_7's QEMU G5 work](https://github.com/cat7/qemu/tree/powermac73) (`powermac73`, as of late September 2026) that speeds up the emulated **ATI Radeon 9800 (R350, `ati-radeon9800`)** on Apple Silicon Macs. It draws the guest's 3D on the host GPU through **Metal** instead of QEMU's software rasterizer.
+This is a fork of [Cat_7's QEMU G5 work](https://github.com/cat7/qemu/tree/G5-openbios) (his branch `G5-openbios`, formerly `powermac73`; forked as of late September 2026) that speeds up the emulated **ATI Radeon 9800 (R350, `ati-radeon9800`)** on Apple Silicon Macs. It draws the guest's 3D on the host GPU through **Metal** instead of QEMU's software rasterizer.
 
 Guest tested: **Mac OS X 10.4.11 Tiger** on an emulated quad-CPU G5, running on a 13" M2 MacBook Pro (16 GB).
 
@@ -91,17 +91,47 @@ We merged Cat_7's latest `powermac73` work (USB 2.0, CoreAudio, GL general progr
 
 ## Build
 
+QEMU needs a few libraries from [Homebrew](https://brew.sh). Install them, then build with only the features a Power Mac needs. Everything else (GTK, SDL, VNC, TLS, USB pass-through and so on) is left out, so the build pulls in five Homebrew libraries instead of several dozen.
+
 ```
+brew install meson ninja pkgconf glib pixman libslirp
 git clone -b FPU-Audio-Fixes https://github.com/lyons88/qemu-g5.git
 cd qemu-g5
 mkdir build && cd build
-../configure --target-list=ppc64-softmmu --enable-cocoa
+../configure --target-list=ppc64-softmmu --enable-cocoa --enable-coreaudio \
+  --enable-slirp --enable-pixman \
+  --disable-gtk --disable-sdl --disable-sdl-image --disable-opengl \
+  --disable-vnc --disable-vnc-jpeg --disable-png --disable-curses \
+  --disable-gnutls --disable-nettle --disable-gcrypt --disable-libssh \
+  --disable-curl --disable-libusb --disable-usb-redir --disable-smartcard \
+  --disable-zstd --disable-lzfse --disable-snappy --disable-lzo \
+  --disable-capstone --disable-gio --disable-dbus-display --disable-spice \
+  --disable-virglrenderer --disable-xkbcommon --disable-tools \
+  --disable-guest-agent --disable-docs
 ninja
 ```
 
+The Metal and CGL renderers for the Radeon 9800 use macOS's own frameworks, not QEMU's `opengl` option, so `--disable-opengl` does not affect them. To check what the binary links, run `otool -L qemu-system-ppc64`. Everything outside `/System` and `/usr/lib` should come from the libraries in the table below.
+
+### Homebrew libraries QEMU uses
+
+These are not part of this repository and are not modified. They are installed from Homebrew on your own Mac. Each Homebrew formula page lists the exact version, its license and the source tarball it was built from.
+
+| Library | Used for | License | Homebrew | Source code |
+|---|---|---|---|---|
+| GLib (`libglib-2.0`, `libgmodule-2.0`) | QEMU's core utility library | LGPL-2.1-or-later | [glib](https://formulae.brew.sh/formula/glib) | [gitlab.gnome.org/GNOME/glib](https://gitlab.gnome.org/GNOME/glib) |
+| gettext (`libintl`, needed by GLib) | Message translation | libintl: LGPL-2.1-or-later (gettext's tools: GPL-3.0-or-later) | [gettext](https://formulae.brew.sh/formula/gettext) | [gnu.org/software/gettext](https://www.gnu.org/software/gettext/) |
+| PCRE2 (`libpcre2-8`, needed by GLib) | Regular expressions | BSD-3-Clause | [pcre2](https://formulae.brew.sh/formula/pcre2) | [github.com/PCRE2Project/pcre2](https://github.com/PCRE2Project/pcre2) |
+| pixman | Display pixel operations | MIT | [pixman](https://formulae.brew.sh/formula/pixman) | [gitlab.freedesktop.org/pixman/pixman](https://gitlab.freedesktop.org/pixman/pixman) |
+| libslirp | User-mode networking (`-nic user`) | BSD-3-Clause | [libslirp](https://formulae.brew.sh/formula/libslirp) | [gitlab.freedesktop.org/slirp/libslirp](https://gitlab.freedesktop.org/slirp/libslirp) |
+
+zlib, bzip2, libiconv and the Cocoa, CoreAudio, Metal and OpenGL frameworks come with macOS.
+
+The G5 OpenBIOS is GPLv2. Its source is [Cat_7's `G5-openbios` branch](https://github.com/cat7/qemu/tree/G5-openbios).
+
 ## Run
 
-You need a Tiger disk image, the OpenBIOS from Cat's G5 releases, and a Radeon 9800 Mac ROM. Run from the folder holding the disk image:
+You need a Tiger disk image, the G5 OpenBIOS (`openbios-ppc`) built from [Cat_7's `G5-openbios` branch](https://github.com/cat7/qemu/tree/G5-openbios), and a Radeon 9800 Mac ROM. Run from the folder holding the disk image:
 
 ```
 ./build/qemu-system-ppc64 -M mac99,via=pmu -smp 4 -m 8G \
