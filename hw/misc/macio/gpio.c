@@ -205,7 +205,7 @@ static const Property macio_gpio_properties[] = {
 
 static const VMStateDescription vmstate_macio_gpio = {
     .name = "macio_gpio",
-    .version_id = 1
+    .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(gpio_levels, MacIOGPIOState, 8),
